@@ -8,7 +8,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/llingr/anvil/lifecycle/shutdown"
+	"github.com/llingr/anvil/shutdown"
 )
 
 func TestIgnoreContextCallsTheFunction(t *testing.T) {
@@ -18,5 +18,16 @@ func TestIgnoreContextCallsTheFunction(t *testing.T) {
 	})(context.Background())
 	if !errors.Is(err, failed) {
 		t.Fatalf("error %v, want the function's", err)
+	}
+}
+
+// Close runs the close function and reports no error
+func TestClose(t *testing.T) {
+	closed := false
+	err := shutdown.Close(func() {
+		closed = true
+	})(context.Background())
+	if err != nil || !closed {
+		t.Fatalf("error %v, closed %v, want nil and closed", err, closed)
 	}
 }

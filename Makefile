@@ -16,7 +16,7 @@ test:
 lint:
 	golangci-lint run ./...
 
-# each target runs on its own; FUZZTIME=5m FUZZPKGS=./lifecycle/... make fuzz to narrow or lengthen the hunt
+# each target runs on its own; FUZZTIME=5m FUZZPKGS=./shutdown/... make fuzz to narrow or lengthen the hunt
 fuzz:
 	@for package in $$(go list $(FUZZPKGS)); do \
 		for target in $$(go test -list='Fuzz.*' $$package | grep '^Fuzz' || true); do \

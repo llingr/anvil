@@ -1,6 +1,16 @@
 # anvil
 
-Building blocks for a Go application.
+A shell for running services requiring config, logging and lifecycle
+management, with a harness for controlling graceful shutdown
+ordering and deadlines.
+
+It is Kubernetes-ready, but can be used in any service or non-trivial
+script to simplify startup and shutdown.
+
+Logging and configuration are promoted to first-class concerns, while the
+Provider pattern allows any logger or config implementation to be used.
+
+## Getting Started
 
 ```sh
 go get github.com/llingr/anvil
@@ -8,104 +18,119 @@ go get github.com/llingr/anvil
 
 ```go
 import (
-    "github.com/llingr/anvil/conf"
-    "github.com/llingr/anvil/lifecycle"
-    "github.com/llingr/anvil/lifecycle/shutdown"
+    "context"
+    "embed"
+    "errors"
+    "net"
+    "net/http"
+    "os"
+    "strconv"
+    "time"
+
+    "github.com/llingr/anvil"
+    "github.com/llingr/anvil-koanf/conf"
+    "github.com/llingr/anvil-zap/zaplog"
+    "github.com/llingr/anvil/shutdown"
+    "go.uber.org/zap"
 )
-```
 
-## Config
-
-Static config uses `github.com/knadh/koanf/v2` in `conf.Load`, adding an environment variable overlay for
-environment-specific settings onto a known/stable YAML backbone. The `UnmarshalFromKoanf[T any]` callback
-allows host applications to control the mapping and verification process.
-
-```yaml
-app:
-  server:
-    port: 8080
-    environment: local
-```
-
-```go
 //go:embed config.yaml
-var configFS embed.FS
+var configFiles embed.FS
 
-type Server struct {
-    Port        int    `koanf:"port"`
-    Environment string `koanf:"environment"`
+type Config struct {
+    Server struct {
+        Port              int           `koanf:"port"`
+        ReadHeaderTimeout time.Duration `koanf:"readHeaderTimeout"`
+    } `koanf:"server"`
 }
 
+// Shell keeps the two type parameters out of every function that takes the shell
+type Shell = anvil.Shell[Config, *zap.Logger]
+
 func main() {
-    // APP_SERVER_ENVIRONMENT=production overrides app.server.environment
-    cfg, err := conf.Load(configFS, func(kfg *koanf.Koanf) (Server, error) {
-        var server Server
-        err := kfg.Unmarshal("app.server", &server)
-        return server, err
+    loggerProvider := zaplog.New(zaplog.DefaultConfig())
+    configProvider := conf.NewProvider[Config](configFiles)
+    exitCode := anvil.Run(context.Background(), "orders", configProvider, loggerProvider, wire)
+    os.Exit(exitCode)
+}
+
+// wire builds the service's components and registers their shutdown
+func wire(ctx context.Context, shell Shell) error {
+    config := shell.Config()
+    mux := http.NewServeMux()
+    mux.HandleFunc("/ready", func(writer http.ResponseWriter, _ *http.Request) {
+        if shell.Stopping() {
+            writer.WriteHeader(http.StatusServiceUnavailable)
+        }
     })
+    listener, err := net.Listen("tcp", net.JoinHostPort("", strconv.Itoa(config.Server.Port)))
     if err != nil {
-        panic(err)
+        return err
     }
-    fmt.Println(cfg.Port, cfg.Environment)
-}
-```
-
-### Files
-
-`Load` reads the `*.yaml` files at the root of a FS - customise using: `WithConfigFileGlob`.
-Files load in matched order.
-
-### Environment Variables
-
-A variable overrides a key the files define, underscores between the words of the path, matched
-regardless of case: `app.server.port` is `APP_SERVER_PORT`.
-
-Which underscores divide a key from the next and which belong inside one is not in the name, so the file
-keys settle it: `APP_SERVER_MAX_CONNS` reaches `app.server.max_conns`, and `MY_APP_SERVER_PORT` reaches
-`my_app.server.port`. A variable naming no key is ignored, so the files stay the complete list of
-settings. A name spelling out two keys at once fails the load rather than guess, as `APP_REQUEST_CEILING`
-does where the files define both `app.request_ceiling` and `app.request.ceiling`. Values stay strings
-until the callback reads or unmarshals them.
-
-## Lifecycle
-
-`Run` runs the wiring, waits for SIGINT, SIGTERM or `app.Stop`, then shuts registered handlers down in
-phases, each within its own budget (28s in total by default, under the Kubernetes 30s grace period). It
-returns once the last phase is done, with the reason for stopping and any handler errors joined together.
-
-```go
-func main() {
-    err := lifecycle.New().Run(func(ctx context.Context, app lifecycle.Application) error {
-        server := &http.Server{Addr: ":8080"}
-        go func() { _ = server.ListenAndServe() }()
-        app.RegisterShutdownHandler("http server", server.Shutdown, shutdown.First)
+    server := &http.Server{
+        Handler:           mux,
+        ReadHeaderTimeout: config.Server.ReadHeaderTimeout,
+    }
+    shell.Go(shutdown.Ingress, "http server", func(context.Context) error {
+        if err := server.Serve(listener); !errors.Is(err, http.ErrServerClosed) {
+            return err
+        }
         return nil
     })
-    if err != nil {
-        log.Print("shutdown: ", err)
-        os.Exit(1)
-    }
+    shell.RegisterShutdownHandler(shutdown.Ingress, "http shutdown", server.Shutdown)
+    return nil
 }
 ```
 
-| phase | runs | default budget |
-|---|---|---|
-| `shutdown.First` | concurrently: intake such as consumers and HTTP servers | 50%, 14s |
-| `shutdown.Default` | in registration order: application services | 25%, 7s |
-| `shutdown.Last` | concurrently: egress such as publishers and pools | 25%, 7s |
+## Features
 
-Each phase ends at the running total of budgets, so time an earlier phase leaves unused carries forward: if
-`First` finishes in 1s, `Default` still ends at 21s and gets 20s.
+- **One call.** `anvil.Run` loads the configuration, calls `wire` to build the service, waits for a
+  stop, shuts down in phases and returns the exit code for `os.Exit`.
+- **Any logger, any configuration source,** through `anvil.LoggerProvider[L]` and
+  `anvil.ConfigProvider[C]`. See [anvil-zap](https://github.com/llingr/anvil-zap) and
+  [anvil-koanf](https://github.com/llingr/anvil-koanf) for reference implementations.
+- **Stops from a signal, `shell.Stop(err)`, or the context passed to `Run`.** A second SIGINT or SIGTERM
+  exits immediately.
+- **Kubernetes shutdown.** After SIGTERM the service keeps serving through a drain delay, with
+  `shell.Stopping()` failing readiness, then shuts down in three phases within one deadline:
+  - `shutdown.Ingress`: consumers and servers, all at once
+  - `shutdown.Core`: application services, one at a time, in reverse registration order
+  - `shutdown.Egress`: publishers and pools, all at once
 
-A `shutdown.Handler` is a `func(ctx context.Context) error`, so a method value such as `server.Shutdown` or a
-closure registers as it is, under the name its errors will carry. `shutdown.IgnoreContext(fn)` adapts a
-`func() error`. Asking twice never waits for the handlers: the process exits with 128 plus the signal
-number. A signal that started the shutdown is the first ask, so the next one quits; a shutdown `Stop`
-started has yet to be asked for, so it absorbs one signal and quits on the one after, and a pod that
-stops itself as the kubelet's SIGTERM arrives still gets its phases. `lifecycle.WithShutdownPhaseBudget`
-sets one phase's budget and panics on an unknown phase, and `lifecycle.WithSignals` adds signals to
-SIGINT and SIGTERM, which are always trapped.
+  ```text
+   0s      SIGTERM: readiness fails, still serving
+           |  drain      5s
+   5s      wire's context cancelled
+           |  INGRESS    11.5s
+  16.5s
+           |  CORE       5.75s
+  22.25s
+           |  EGRESS     5.75s
+  28s      deadline
+  30s      Kubernetes sends SIGKILL
+  ```
 
-## Licence
+  A handler still running at its phase's deadline is reported and left behind.
+- **Goroutines.** `shell.Go` runs a server's or a consumer's loop, stops the service if the loop fails
+  or panics, logs an error if it returns before any stop, and has the loop's phase wait for it.
+- **Lifecycle logs**, one line per step:
 
-Apache-2.0. See LICENSE.
+  ```text
+  starting orders
+  loading config
+  configuration loaded in 2.1ms
+  started orders
+  stopping: terminated signal received
+  draining for 5s before INGRESS
+  INGRESS done in 312ms: http server 312ms, http shutdown 311ms
+  exiting orders
+  ```
+- **Exit codes:** 0 after a clean stop, 130 after Ctrl+C (128 plus the signal for one added with
+  `WithStopSignals`), 1 after a logged failure.
+
+## Options
+
+- `anvil.WithShutdownDeadline(d)`: the whole shutdown, drain included; 28s
+- `anvil.WithShutdownPhaseBudget(phase, d)`: one phase's time; the others share what is left
+- `anvil.WithDrainDelay(d)`: serving on after SIGTERM; 5s, set 0 outside Kubernetes
+- `anvil.WithStopSignals(signals...)`: more signals that stop the service as Ctrl+C does

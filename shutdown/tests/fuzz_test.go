@@ -6,17 +6,17 @@ package tests
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/llingr/anvil/lifecycle/shutdown"
+	"github.com/llingr/anvil/shutdown"
 )
 
-// FuzzBudgetsTotalDuration feeds arbitrary budgets in: the total is the three phases summed,
-// and String reports the same total
-func FuzzBudgetsTotalDuration(f *testing.F) {
+// FuzzBudgetsString feeds arbitrary budgets in: String reports each phase with its budget
+func FuzzBudgetsString(f *testing.F) {
 	f.Add(int64(14*time.Second), int64(7*time.Second), int64(7*time.Second))
 	f.Add(int64(0), int64(0), int64(0))
 	f.Add(int64(-1), int64(1), int64(0))
@@ -24,24 +24,22 @@ func FuzzBudgetsTotalDuration(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, first, other, last int64) {
 		budgets := shutdown.Budgets{
-			shutdown.First:   time.Duration(first),
-			shutdown.Default: time.Duration(other),
-			shutdown.Last:    time.Duration(last),
+			shutdown.Ingress: time.Duration(first),
+			shutdown.Core:    time.Duration(other),
+			shutdown.Egress:  time.Duration(last),
 		}
-		want := time.Duration(first) + time.Duration(other) + time.Duration(last)
-		if got := budgets.TotalDuration(); got != want {
-			t.Fatalf("TotalDuration() = %s, want %s", got, want)
-		}
-		if !strings.Contains(budgets.String(), want.String()) {
-			t.Fatalf("String() = %q, want the total %s in it", budgets.String(), want)
+		for _, phase := range shutdown.Phases() {
+			if part := fmt.Sprintf("%s %s", phase, budgets[phase]); !strings.Contains(budgets.String(), part) {
+				t.Fatalf("String() = %q, want %q in it", budgets.String(), part)
+			}
 		}
 	})
 }
 
-// FuzzBudgetsIgnoreUnknownPhases checks a phase nobody runs cannot change the total
-func FuzzBudgetsIgnoreUnknownPhases(f *testing.F) {
-	f.Add("FIRST", int64(time.Second))
-	f.Add("first", int64(time.Second))
+// FuzzBudgetsStringIgnoresUnknownPhases checks a phase nobody runs never reaches the log line
+func FuzzBudgetsStringIgnoresUnknownPhases(f *testing.F) {
+	f.Add("INGRESS", int64(time.Second))
+	f.Add("ingress", int64(time.Second))
 	f.Add("", int64(time.Second))
 	f.Add("SECOND", int64(time.Second))
 
@@ -49,12 +47,12 @@ func FuzzBudgetsIgnoreUnknownPhases(f *testing.F) {
 		budgets := shutdown.Budgets{}
 		budgets[shutdown.Phase(phaseName)] = time.Duration(nanoseconds)
 
-		want := time.Duration(0)
+		want := ""
 		if slices.Contains(shutdown.Phases(), shutdown.Phase(phaseName)) {
-			want = time.Duration(nanoseconds)
+			want = fmt.Sprintf("%s %s", phaseName, time.Duration(nanoseconds))
 		}
-		if got := budgets.TotalDuration(); got != want {
-			t.Fatalf("phase %q gave a total of %s, want %s", phaseName, got, want)
+		if got := budgets.String(); got != want {
+			t.Fatalf("phase %q gave %q, want %q", phaseName, got, want)
 		}
 	})
 }
