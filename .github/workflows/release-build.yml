@@ -1,0 +1,83 @@
+name: Release build
+
+# Trusted builder: builds the release assets and signs the attestations.
+# Runs only via workflow_call from release.yml. Holds signing permissions
+# but NO contents:write; the caller's publish job is the inverse.
+# Verify with:
+#   gh attestation verify <asset> --repo llingr/anvil \
+#     --signer-workflow llingr/anvil/.github/workflows/release-build.yml
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build & attest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Source archive
+        run: >
+          git archive --format=tar.gz
+          --prefix="anvil-${GITHUB_REF_NAME}/"
+          -o "anvil_${GITHUB_REF_NAME}.tar.gz"
+          "${GITHUB_REF_NAME}"
+
+      - name: Generate CycloneDX SBOM (cyclonedx-gomod)
+        run: >
+          go run github.com/CycloneDX/cyclonedx-gomod/cmd/cyclonedx-gomod@v1.10.0
+          mod -licenses -type library -json
+          -output "anvil_${GITHUB_REF_NAME}.cdx.json"
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+
+      - name: Generate SPDX SBOM (syft)
+        run: >
+          syft dir:.
+          --exclude './.github/**'
+          --source-name anvil
+          --source-version "${GITHUB_REF_NAME}"
+          --source-supplier "David Green"
+          -o "spdx-json=anvil_${GITHUB_REF_NAME}.spdx.json"
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: anvil_${{ github.ref_name }}.tar.gz
+
+      # the attestation lives in GitHub's store; the bundle beside the tarball
+      # makes the provenance verifiable offline too
+      - name: Attach provenance bundle
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "anvil_${GITHUB_REF_NAME}.tar.gz.sigstore"
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: anvil_${{ github.ref_name }}.tar.gz
+          sbom-path: anvil_${{ github.ref_name }}.cdx.json
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: anvil_${{ github.ref_name }}.*
+          if-no-files-found: error
+          retention-days: 1
