@@ -13,8 +13,9 @@ test:
 	go test -race -coverpkg=./... -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out
 
+# same image and version as the CI lint job, nothing installed on the host
 lint:
-	golangci-lint run ./...
+	docker run --rm -v "$(CURDIR)":/app -w /app golangci/golangci-lint:v2.12.2 golangci-lint run ./...
 
 # each target runs on its own; FUZZTIME=5m FUZZPKGS=./shutdown/... make fuzz to narrow or lengthen the hunt
 fuzz:

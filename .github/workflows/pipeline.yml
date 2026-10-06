@@ -1,0 +1,46 @@
+name: Pipeline
+# Distinguish push vs PR runs at a glance in the Actions list.
+run-name: "Pipeline (${{ github.event_name == 'pull_request' && format('PR #{0}', github.event.pull_request.number) || format('push {0}', github.ref_name) }})"
+
+# Single entry point for CI. Each check lives in its own reusable workflow file;
+# calling them from here collapses the many-rows-per-commit into one. Cheap checks
+# run on every branch push; the expensive suite (tests, CodeQL) runs only on a PR,
+# held behind the cheap checks so a cheap failure skips the heavy work.
+
+on:
+  # Every branch push (not tags: those fall through to release.yml).
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint
+    uses: ./.github/workflows/lint.yml
+
+  vulncheck:
+    name: Vulncheck
+    uses: ./.github/workflows/vulncheck.yml
+
+  ci:
+    name: CI
+    if: github.event_name == 'pull_request'
+    needs: [lint, vulncheck]
+    uses: ./.github/workflows/ci.yml
+
+  codeql:
+    name: CodeQL
+    if: github.event_name == 'pull_request'
+    needs: [lint, vulncheck]
+    uses: ./.github/workflows/codeql.yml
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
