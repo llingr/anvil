@@ -263,18 +263,14 @@ func TestMain(m *testing.M) {
 	case "drain", "drain-forced", "drain-sigint":
 		exitCode := anvil.Run(context.Background(), "test", noConfig{}, chattyLogging{}, func(ctx context.Context, shell testShell) error {
 			shell.RegisterShutdownHandler(shutdown.Ingress, "http server", func(context.Context) error {
-				log.Print("ingress ran")
+				log.Printf("ingress ran, wire ctx %v", ctx.Err())
 				return nil
 			})
-			go func() {
-				<-ctx.Done()
-				log.Print("wire ctx done")
-			}()
 			go func() {
 				for !shell.Stopping() { // a readiness probe's view
 					time.Sleep(10 * time.Millisecond)
 				}
-				log.Print("not ready")
+				log.Printf("not ready, wire ctx %v", ctx.Err())
 			}()
 			fmt.Println("ready")
 			return nil
@@ -496,7 +492,7 @@ func TestMainDrainDelay(t *testing.T) {
 		t.Fatalf("exit after %s, want the 300ms drain first", elapsed)
 	}
 	if code != 0 || !inOrder(output, "stopping: terminated signal received", "draining for 300ms before INGRESS",
-		"not ready", "wire ctx done", "ingress ran", "INGRESS done in ") {
+		"ingress ran, wire ctx context canceled", "INGRESS done in ") || !strings.Contains(output, "not ready, wire ctx <nil>") {
 		t.Fatalf("drain exit %d: %s", code, output)
 	}
 }
