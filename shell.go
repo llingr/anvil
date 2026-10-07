@@ -19,71 +19,62 @@ import (
 	"github.com/llingr/anvil/shutdown"
 )
 
-// Shell is the handle wire receives: the service's config C and logger L, and the means to
-// register its shutdown handlers and to stop it.
+// Shell for running services requiring config,
+// logging, and graceful shutdown orchestration.
 type Shell[C, L any] interface {
-	// RegisterShutdownHandler adds handler to phase under name, from wire before it returns. A later
-	// call, such as from a reconnect loop or a lazily built component, is refused: anvil logs an
-	// error and the handler never runs. Register a component once in wire, and have its handler
-	// cope with whatever state the component is in at shutdown.
-	RegisterShutdownHandler(phase shutdown.Phase, name string, handler shutdown.Handler)
-
-	// Go runs fn on its own goroutine, with a ctx cancelled as phase begins, and has phase wait for
-	// it to return. An error or panic from fn stops the service, under name, and a nil return before
-	// any stop is logged as an error; once told to stop, fn returns nil, and an error then fails the
-	// shutdown. Like RegisterShutdownHandler it is refused once wire has returned.
-	Go(phase shutdown.Phase, name string, fn func(ctx context.Context) error)
-
-	// Stop begins shutdown: a nil reason is a clean stop and any other makes Run return 1; the first
-	// reason wins
-	Stop(reason error)
-
-	// Config provided during Run
+	// Config for the service
 	Config() C
 
-	// Logger convenience accessor to chosen logger
+	// Logger for the service, and the Shell
 	Logger() L
+
+	// RegisterShutdownHandler includes a component in
+	// graceful shutdown orchestration. Components must
+	// only be registered during wiring.
+	RegisterShutdownHandler(phase shutdown.Phase, name string, handler shutdown.Handler)
+
+	// Go runs fn on its own goroutine and registered for
+	// graceful shutdown. Must only be started during wiring.
+	// Examples include HTTP servers and message consumers.
+	Go(phase shutdown.Phase, name string, fn func(ctx context.Context) error)
+
+	// Stop invokes shutdown without waiting for OS signals.
+	// Use nil reason to indicate a clean stop, otherwise Run
+	// will return exit code 1. This method is idempotent.
+	Stop(reason error)
 
 	// Stopping reports whether shutdown has begun, from any trigger, for a
 	// readiness probe to fail during shutdown
 	Stopping() bool
 }
 
-// Wiring builds the application's components and registers their shutdown handlers, then returns
-// rather than blocking. Its ctx carries the values of Run's ctx but has a cancellation of its own,
-// which fires as the shutdown phases begin: after any drain delay, before Ingress.
+// Wiring wraps application initialization. This is the same
+// as idiomatic wiring in main(), with the shell's provided
+// Config C, Logger L, shutdown registration and Go routines.
+//
+// SIGINT, SIGTERM, Stop() and ctx cancellation all invoke the
+// Shell's coordinated shutdown.
 type Wiring[C, L any] func(ctx context.Context, shell Shell[C, L]) error
 
+// shell container wrapping
 type shell[C, L any] struct {
-	name             string
-	detached         context.Context // Run's ctx without its cancellation: logging, wire and the handlers build on it
-	loggerProvider   LoggerProvider[L]
-	config           C
-	options          options
-	phaseCtx         map[shutdown.Phase]context.Context    // what Go hands its goroutines
-	endPhaseCtx      map[shutdown.Phase]context.CancelFunc // called as each phase begins
-	stopped          chan struct{}                         // closed by the first stop, once stoppedAt and stopReason are set
-	mu               sync.Mutex                            // protects started, stoppedAt, stopReason and shutdownHandlers
-	started          bool                                  // wire has returned, closing registration
-	stoppedAt        time.Time                             // when the stop that won arrived
+	name             string                                // of the application, used in logging
+	detached         context.Context                       // Run's ctx without its cancellation
+	loggerProvider   LoggerProvider[L]                     // provided to Run
+	config           C                                     // provided to Run
+	options          options                               // for graceful shutdown
+	phaseCtx         map[shutdown.Phase]context.Context    // provided to Go routines, canceled to signal shut-down
+	endPhaseCtx      map[shutdown.Phase]context.CancelFunc // called to signal Go function to shut-down
+	stopped          chan struct{}                         // closed when stoppedTime and stopReason are set
+	mu               sync.Mutex                            // protects started, stoppedTime, stopReason, shutdownHandlers
+	started          bool                                  // indicates wiring has returned; finalizes registration
+	stoppedTime      time.Time                             // first invoked time; stopping is idempotent
 	stopReason       error                                 // nil for a clean Stop(nil)
 	shutdownHandlers map[shutdown.Phase][]registeredHandler
 }
 
-// Run is the service's whole lifecycle, and returns the exit code for main to pass to os.Exit.
-//
-// It logs "starting <name>", loads the configuration, then traps SIGINT and SIGTERM. It calls wire
-// and waits for a trapped signal, the cancellation of ctx, or a Stop. Last, it runs the shutdown
-// handlers in phases and logs "exiting <name>".
-//
-// It returns 0 after a clean stop, or 130 when Ctrl+C asked for it (128 plus the signal for any
-// other signal but SIGTERM), as the calling process expects of an interrupt. It returns 1 after a
-// failure it has logged: a configuration that cannot be loaded, wire, the stop reason or a handler
-// failing. A second SIGINT or SIGTERM ends the process at once, by Go's default handling, so Run
-// does not return.
-//
-// A nil provider or wire panics. Any other panic escaping Run is logged and the logger flushed,
-// then raised again.
+// Run wraps a service or applications' whole lifecycle,
+// returning an integer to be using as an os.Exit code
 func Run[C, L any](
 	ctx context.Context, name string,
 	configProvider ConfigProvider[C],
@@ -91,6 +82,7 @@ func Run[C, L any](
 	wire Wiring[C, L],
 	opts ...Option) int {
 
+	// initialisation and core validation
 	switch {
 	case isNil(configProvider):
 		const nilConfigProvider = "anvil: nil ConfigProvider[%s], cannot start"
@@ -105,24 +97,20 @@ func Run[C, L any](
 
 	ctxNoCxl := context.WithoutCancel(ctx)
 	defer flushLogger(ctxNoCxl, loggerProvider)
-
-	processedOptions := processOptions(opts...)
-
 	loggerProvider.LifecycleInfo(ctxNoCxl, "starting "+name)
+	processedOptions := processOptions(opts...)
 
 	// config
 	loggerProvider.LifecycleInfo(ctxNoCxl, "loading config")
 	loadStart := time.Now()
-
-	// blocking call, config providers must manage their own timeouts
-	config, err := configProvider.Load(ctx)
+	config, err := configProvider.Load(ctx) // blocking call, config providers must manage their own timeouts
 	if err != nil {
-		loggerProvider.LifecycleError(ctxNoCxl, "loading config", err)
-		loggerProvider.LifecycleInfo(ctxNoCxl, "exiting "+name)
+		loggerProvider.LifecycleError(ctxNoCxl, "failed to load config", err)
 		return 1
+	} else {
+		took := time.Since(loadStart).Truncate(time.Microsecond)
+		loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf("configuration loaded in %s", took))
 	}
-	const configLoaded = "configuration loaded in %s"
-	loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf(configLoaded, time.Since(loadStart).Truncate(time.Microsecond)))
 
 	s := &shell[C, L]{
 		name:             name,
@@ -139,7 +127,7 @@ func Run[C, L any](
 		s.phaseCtx[phase], s.endPhaseCtx[phase] = context.WithCancel(ctxNoCxl)
 	}
 
-	// trapped only now: during the load the default handling ends the process, nothing having started
+	// shutdown orchestration
 	shutdownSignals := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
 	for _, additional := range s.options.signals {
 		if !slices.Contains(shutdownSignals, additional) {
@@ -161,22 +149,29 @@ func Run[C, L any](
 		s.requestStop(reason)
 	})
 	defer releaseCtx()
+
+	// call host application wiring
 	return s.run(wire)
 }
 
-// run calls wire, awaits the stop and shuts down, returning the exit code
+// run calls application wiring, then awaits shutdown
 func (s *shell[C, L]) run(wire Wiring[C, L]) int {
 	ctx, cancel := context.WithCancel(s.detached)
 	defer cancel()
 
-	wireErr := s.callWire(ctx, wire) // wire has no timeout, wiring must complete or exit with an error
+	// blocking call, wiring must complete or exit with an error
+	wireErr := s.callWire(ctx, wire)
+
 	s.markStarted()
 	if wireErr != nil {
 		s.requestStop(fmt.Errorf("wiring failed: %w", wireErr))
 	} else {
 		s.loggerProvider.LifecycleInfo(s.detached, "started "+s.name)
 	}
+
+	<-s.stopped // a signal, Stop, Run's ctx, or wire failure
 	err := s.shutdown(cancel)
+
 	if wireErr != nil && !errors.Is(err, wireErr) {
 		err = errors.Join(wireErr, err) // wire's error is a failure, even as a clean-looking stop reason
 	}
