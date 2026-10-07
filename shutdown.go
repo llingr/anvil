@@ -19,7 +19,6 @@ import (
 // shutdown waits for a stop, drains if a SIGTERM asked, cancels wire's ctx, then runs the
 // phases within the shutdown deadline
 func (s *shell[C, L]) shutdown(cancelWire context.CancelFunc) error {
-	<-s.stopped
 	cause := s.reason()
 	stopping := "Stop called"
 	if cause != nil {
@@ -34,7 +33,7 @@ func (s *shell[C, L]) shutdown(cancelWire context.CancelFunc) error {
 	// SIGTERM is Kubernetes taking the pod out of its endpoints, so keep serving meanwhile. Ctrl+C
 	// (SIGINT), Stop and a cancelled ctx skip only the wait: the phases still run, so servers and
 	// pools close properly on a developer's machine too, and the drain's time goes to the phases.
-	drainEnd := s.shutdownStart().Add(s.options.drainDelay)
+	drainEnd := s.shutdownTime().Add(s.options.drainDelay)
 	if drainLeft := time.Until(drainEnd); stoppedBySignal(cause) == syscall.SIGTERM && drainLeft > 0 {
 		s.loggerProvider.LifecycleInfo(s.detached, fmt.Sprintf("draining for %s before %s", drainLeft.Round(time.Millisecond), shutdown.Ingress))
 		time.Sleep(drainLeft) // a second signal will exit immediately
@@ -51,35 +50,37 @@ func cleanStop(cause error) bool {
 // errRunCtxCancelled is the reason when the ctx passed to Run is cancelled
 var errRunCtxCancelled = errors.New("the ctx passed to Run was cancelled")
 
-// requestStop begins shutdown for reason, which says what asked for it, when no stop came before it,
-// and reports whether it did
+// requestStop initiates the graceful shut-down process
 func (s *shell[C, L]) requestStop(reason error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var isFirst bool
 	select {
 	case <-s.stopped:
-		return false // subsequent stops/reasons are ignored
+		isFirst = false // idempotent indicator
 	default:
+		isFirst = true
+		s.stopReason = reason
+		s.stoppedTime = time.Now()
+		close(s.stopped)
 	}
-	s.stoppedAt = time.Now()
-	s.stopReason = reason
-	close(s.stopped)
-	return true
+	return isFirst
 }
 
-// reason is why the application stopped: nil for a clean Stop(nil)
+// reason for shutdown, nil for a clean Stop(nil)
 func (s *shell[C, L]) reason() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.stopReason
 }
 
-// shutdownStart is when the stop that won arrived: the drain and every phase deadline count from it,
-// so a wire returning late takes its time out of the shutdown rather than adding to it
-func (s *shell[C, L]) shutdownStart() time.Time {
+// shutdownTime when the (first) stop arrived; phased
+// drains and theirs deadlines count from this point.
+func (s *shell[C, L]) shutdownTime() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.stoppedAt
+	return s.stoppedTime
 }
 
 // runPhases ends each phase at the running total of budgets from the drain's end, so time a phase
@@ -135,8 +136,8 @@ func (s *shell[C, L]) shutdownPhase(phase shutdown.Phase, deadline time.Time) []
 	return failures
 }
 
-// errSkipped fails a handler never started, so that no two Core handlers ever run at once and
-// none is left running behind the next phase
+// errSkipped indicates a handler not started because an
+// overrunning handler had used up its phase's deadline.
 var errSkipped = errors.New("skipped, the phase's deadline had passed")
 
 // phaseSummary reads "CORE done in 5.7s: orders skipped, ledger failed after 5.7s, outbox 2ms"
@@ -155,8 +156,9 @@ func phaseSummary(phase shutdown.Phase, elapsed time.Duration, handlers []regist
 	return fmt.Sprintf("%s done in %s: %s", phase, elapsed.Truncate(time.Microsecond), strings.Join(parts, ", "))
 }
 
-// invoke waits for the handler or the budget, whichever ends first; a handler
-// still running at the deadline is left to finish on its own
+// invoke runs the handler and returns when the handler returns or the phase
+// deadline passes. If the deadline passes first, the handler is abandoned but
+// keeps running in the background.
 func invoke(ctx context.Context, phase shutdown.Phase, registered registeredHandler) error {
 	done := make(chan error, 1)
 	go func() {
