@@ -24,6 +24,13 @@ type LoggerProvider[L any] interface {
 	Flush()
 }
 
+// ConfigLogger optionally implemented by a LoggerProvider to
+// call LogConfig instead of issuing a plain 'config loaded'
+// message. Providers must take care not to expose secrets.
+type ConfigLogger interface {
+	LogConfig(ctx context.Context, msg string, config any)
+}
+
 // flushLogger, deferred, flushes the logger, first logging a panic, which then carries on to crash
 // the process with Go's own trace
 func flushLogger[L any](ctx context.Context, loggerProvider LoggerProvider[L]) {

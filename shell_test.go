@@ -489,6 +489,66 @@ func TestRunReturnsExitCodes(t *testing.T) {
 	}
 }
 
+// configLogging is a provider implementing anvil.ConfigLogger, recording every lifecycle line
+type configLogging struct {
+	quietLogger
+	info    []string
+	configs []any
+}
+
+func (c *configLogging) LifecycleInfo(_ context.Context, msg string) {
+	c.info = append(c.info, msg)
+}
+
+func (c *configLogging) LogConfig(_ context.Context, msg string, config any) {
+	c.info = append(c.info, msg)
+	c.configs = append(c.configs, config)
+}
+
+var _ anvil.ConfigLogger = (*configLogging)(nil)
+
+// portConfig is a config provider whose loaded value can be recognised
+type portConfig struct {
+	port int
+	err  error
+}
+
+func (p portConfig) Load(context.Context) (portConfig, error) {
+	return p, p.err
+}
+
+// A provider implementing ConfigLogger is handed the loaded configuration once, on the
+// "configuration loaded" line, which is not also logged through LifecycleInfo
+func TestConfigLoggerReceivesTheLoadedConfig(t *testing.T) {
+	logger := &configLogging{}
+	code := anvil.Run(context.Background(), "test", portConfig{port: 8080}, logger,
+		func(ctx context.Context, shell anvil.Shell[portConfig, quietLogger]) error {
+			shell.Stop(nil)
+			return nil
+		})
+	loadedLines := 0
+	for _, msg := range logger.info {
+		if strings.HasPrefix(msg, "configuration loaded in ") {
+			loadedLines++
+		}
+	}
+	if code != 0 || loadedLines != 1 || len(logger.configs) != 1 || logger.configs[0] != (portConfig{port: 8080}) {
+		t.Fatalf("exit %d, configs %v, lines %q, want 0 and one loaded line carrying {8080}", code, logger.configs, logger.info)
+	}
+}
+
+// A load that fails hands the provider no configuration
+func TestConfigLoggerNotCalledWhenTheLoadFails(t *testing.T) {
+	logger := &configLogging{}
+	code := anvil.Run(context.Background(), "test", portConfig{err: errors.New("unreadable")}, logger,
+		func(context.Context, anvil.Shell[portConfig, quietLogger]) error {
+			return nil
+		})
+	if code != 1 || len(logger.configs) != 0 {
+		t.Fatalf("exit %d, configs %v, want 1 and none", code, logger.configs)
+	}
+}
+
 // A ctx already done when Run is called stops the application as soon as it starts, through the
 // usual shutdown, once a provider that ignores the ctx has loaded the configuration anyway
 func TestDoneCtxStopsAtOnce(t *testing.T) {

@@ -109,8 +109,13 @@ func Run[C, L any](
 		loggerProvider.LifecycleInfo(ctxNoCxl, "exiting "+name)
 		return 1
 	}
+	const configLoadedMessage = "configuration loaded in %s"
 	took := time.Since(loadStart).Truncate(time.Microsecond)
-	loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf("configuration loaded in %s", took))
+	if configLogger, ok := loggerProvider.(ConfigLogger); ok {
+		configLogger.LogConfig(ctxNoCxl, fmt.Sprintf(configLoadedMessage, took), config)
+	} else {
+		loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf(configLoadedMessage, took))
+	}
 
 	s := &shell[C, L]{
 		name:             name,

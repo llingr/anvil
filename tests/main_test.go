@@ -354,7 +354,7 @@ func TestMainWiringPanic(t *testing.T) {
 // process with Go's exit code 2
 func TestMainRunPanicFlushes(t *testing.T) {
 	code, output := runMain(t, "run-panic")
-	if code != 2 || !strings.Contains(output, "panicked: logger broke") || !strings.Contains(output, "flushed") {
+	if code != 2 || !inOrder(output, "panicked: logger broke", "flushed") {
 		t.Fatalf("run panic exit %d: %s", code, output)
 	}
 }
@@ -363,7 +363,7 @@ func TestMainRunPanicFlushes(t *testing.T) {
 // with Go's exit code 2
 func TestMainLoadPanicFlushes(t *testing.T) {
 	code, output := runMain(t, "load-panic")
-	if code != 2 || !strings.Contains(output, "panicked: config exploded") || !strings.Contains(output, "flushed") {
+	if code != 2 || !inOrder(output, "panicked: config exploded", "flushed") {
 		t.Fatalf("load panic exit %d: %s", code, output)
 	}
 }
