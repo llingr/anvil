@@ -106,11 +106,11 @@ func Run[C, L any](
 	config, err := configProvider.Load(ctx) // blocking call, config providers must manage their own timeouts
 	if err != nil {
 		loggerProvider.LifecycleError(ctxNoCxl, "failed to load config", err)
+		loggerProvider.LifecycleInfo(ctxNoCxl, "exiting "+name)
 		return 1
-	} else {
-		took := time.Since(loadStart).Truncate(time.Microsecond)
-		loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf("configuration loaded in %s", took))
 	}
+	took := time.Since(loadStart).Truncate(time.Microsecond)
+	loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf("configuration loaded in %s", took))
 
 	s := &shell[C, L]{
 		name:             name,

@@ -376,7 +376,7 @@ func TestMainLoadHangsUntilRunsCtxEnds(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("exit took %s, want exit at the deadline", elapsed)
 	}
-	if code != 1 || !strings.Contains(output, "loading config: context deadline exceeded") {
+	if code != 1 || !strings.Contains(output, "failed to load config: context deadline exceeded") {
 		t.Fatalf("hanging load exit %d: %s", code, output)
 	}
 }
@@ -386,7 +386,7 @@ func TestMainLoadHangsUntilRunsCtxEnds(t *testing.T) {
 func TestMainDoneCtxFailsTheLoad(t *testing.T) {
 	code, output := runMain(t, "done-ctx")
 	if code != 1 || strings.Contains(output, "started") ||
-		!inOrder(output, "starting test", "loading config: context canceled", "exiting test") {
+		!inOrder(output, "starting test", "failed to load config: context canceled", "exiting test") {
 		t.Fatalf("done ctx exit %d: %s", code, output)
 	}
 }
