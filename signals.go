@@ -10,6 +10,8 @@ import (
 	"syscall"
 )
 
+const kubernetesTermSignal = syscall.SIGTERM
+
 // signalStop is the stop reason a trapped signal gives; its unexported type tells a signal's stop
 // from any reason passed to Stop
 type signalStop struct {
@@ -40,13 +42,4 @@ func (s *shell[C, L]) watchSignals(signals chan os.Signal, done <-chan struct{})
 		})
 	case <-done:
 	}
-}
-
-// signalExitCode is 128 plus the signal number, the Unix convention for a process a signal ended
-func signalExitCode(received os.Signal) int {
-	number, ok := received.(syscall.Signal)
-	if !ok {
-		return 1
-	}
-	return 128 + int(number)
 }

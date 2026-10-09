@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"runtime/debug"
 	"slices"
 	"sync"
 	"syscall"
@@ -28,15 +27,10 @@ type Shell[C, L any] interface {
 	// Logger for the service, and the Shell
 	Logger() L
 
-	// RegisterShutdownHandler includes a component in
-	// graceful shutdown orchestration. Components must
-	// only be registered during wiring.
-	RegisterShutdownHandler(phase shutdown.Phase, name string, handler shutdown.Handler)
-
-	// Go runs fn on its own goroutine and registered for
-	// graceful shutdown. Must only be started during wiring.
-	// Examples include HTTP servers and message consumers.
-	Go(phase shutdown.Phase, name string, fn func(ctx context.Context) error)
+	// AddShutdownGroup adds a group of handlers that stop
+	// together, after the groups already added. Must only
+	// be called during wiring.
+	AddShutdownGroup(handlers ...shutdown.Handler) ShutdownGroup
 
 	// Stop invokes shutdown without waiting for OS signals.
 	// Use nil reason to indicate a clean stop, otherwise Run
@@ -50,27 +44,32 @@ type Shell[C, L any] interface {
 
 // Wiring wraps application initialization. This is the same
 // as idiomatic wiring in main(), with the shell's provided
-// Config C, Logger L, shutdown registration and Go routines.
+// Config C, Logger L, shutdown handlers and Go routines.
 //
 // SIGINT, SIGTERM, Stop() and ctx cancellation all invoke the
-// Shell's coordinated shutdown.
+// Shell's coordinated shutdown. A stop before or during wiring
+// cancels ctx at once, and an error from wire that is only that
+// cancellation counts as a clean stop. A stop after wiring
+// cancels ctx once the shutdown has run, just before Run returns.
 type Wiring[C, L any] func(ctx context.Context, shell Shell[C, L]) error
 
 // shell container wrapping
 type shell[C, L any] struct {
-	name             string                                // of the application, used in logging
-	detached         context.Context                       // Run's ctx without its cancellation
-	loggerProvider   LoggerProvider[L]                     // provided to Run
-	config           C                                     // provided to Run
-	options          options                               // for graceful shutdown
-	phaseCtx         map[shutdown.Phase]context.Context    // provided to Go routines, canceled to signal shut-down
-	endPhaseCtx      map[shutdown.Phase]context.CancelFunc // called to signal Go function to shut-down
-	stopped          chan struct{}                         // closed when stoppedTime and stopReason are set
-	mu               sync.Mutex                            // protects started, stoppedTime, stopReason, shutdownHandlers
-	started          bool                                  // indicates wiring has returned; finalizes registration
-	stoppedTime      time.Time                             // first invoked time; stopping is idempotent
-	stopReason       error                                 // nil for a clean Stop(nil)
-	shutdownHandlers map[shutdown.Phase][]registeredHandler
+	name           string                  // of the application, used in logging
+	runCtx         context.Context         // Run's ctx without its cancellation
+	loggerProvider LoggerProvider[L]       // provided to Run
+	config         C                       // provided to Run
+	options        options                 // for graceful shutdown
+	wireCtx        context.Context         // wire's ctx: Run's values, a cancellation of its own
+	wireCtxCancel  context.CancelFunc      // cancels wireCtx
+	goCtx          context.Context         // every Go function's ctx is derived from it
+	goCtxCancel    context.CancelCauseFunc // cancels goCtx
+	stopped        chan struct{}           // closed once stoppedTime and stopReason are set, which never change after
+	mu             sync.Mutex              // protects started, phases' handlers, and the stop until stopped closes
+	started        bool                    // indicates wiring has returned; finalizes registration
+	stoppedTime    time.Time               // first invoked time; stopping is idempotent
+	stopReason     error                   // nil for a clean Stop(nil)
+	groups         []*shutdownGroup        // in shutdown order
 }
 
 // Run wraps a service or applications' whole lifecycle,
@@ -117,23 +116,10 @@ func Run[C, L any](
 		loggerProvider.LifecycleInfo(ctxNoCxl, fmt.Sprintf(configLoadedMessage, took))
 	}
 
-	s := &shell[C, L]{
-		name:             name,
-		detached:         ctxNoCxl,
-		loggerProvider:   loggerProvider,
-		config:           config,
-		options:          processedOptions,
-		stopped:          make(chan struct{}),
-		phaseCtx:         make(map[shutdown.Phase]context.Context),
-		endPhaseCtx:      make(map[shutdown.Phase]context.CancelFunc),
-		shutdownHandlers: make(map[shutdown.Phase][]registeredHandler),
-	}
-	for _, phase := range shutdown.Phases() {
-		s.phaseCtx[phase], s.endPhaseCtx[phase] = context.WithCancel(ctxNoCxl)
-	}
+	s := initShell(name, ctxNoCxl, loggerProvider, config, processedOptions)
 
 	// shutdown orchestration
-	shutdownSignals := []os.Signal{syscall.SIGINT, syscall.SIGTERM}
+	shutdownSignals := []os.Signal{syscall.SIGINT, kubernetesTermSignal}
 	for _, additional := range s.options.signals {
 		if !slices.Contains(shutdownSignals, additional) {
 			shutdownSignals = append(shutdownSignals, additional)
@@ -159,60 +145,107 @@ func Run[C, L any](
 	return s.run(wire)
 }
 
-// run calls application wiring, then awaits shutdown
-func (s *shell[C, L]) run(wire Wiring[C, L]) int {
-	ctx, cancel := context.WithCancel(s.detached)
-	defer cancel()
-
-	// blocking call, wiring must complete or exit with an error
-	wireErr := s.callWire(ctx, wire)
-
-	s.markStarted()
-	if wireErr != nil {
-		s.requestStop(fmt.Errorf("wiring failed: %w", wireErr))
-	} else {
-		s.loggerProvider.LifecycleInfo(s.detached, "started "+s.name)
+func initShell[C, L any](
+	name string, runCtx context.Context, loggerProvider LoggerProvider[L], config C, options options,
+) *shell[C, L] {
+	s := &shell[C, L]{
+		name:           name,
+		runCtx:         runCtx,
+		loggerProvider: loggerProvider,
+		config:         config,
+		options:        options,
+		stopped:        make(chan struct{}),
 	}
-
-	<-s.stopped // a signal, Stop, Run's ctx, or wire failure
-	err := s.shutdown(cancel)
-
-	if wireErr != nil && !errors.Is(err, wireErr) {
-		err = errors.Join(wireErr, err) // wire's error is a failure, even as a clean-looking stop reason
-	}
-	return s.exit(err)
+	s.wireCtx, s.wireCtxCancel = context.WithCancel(runCtx)
+	s.goCtx, s.goCtxCancel = context.WithCancelCause(runCtx)
+	return s
 }
 
-// exit logs err, then "exiting <name>" as the last line, and returns 1 for an err, else the clean
-// stop's exit code
-func (s *shell[C, L]) exit(err error) int {
-	exitCode := s.cleanExitCode()
-	if err != nil {
-		s.loggerProvider.LifecycleError(s.detached, "stopped with an error", err)
+// run calls application wiring, then awaits shutdown
+func (s *shell[C, L]) run(wire Wiring[C, L]) int {
+
+	// call wire and report whether a stop signal came while it ran
+	stoppedDuringWiring, wireErr := func() (bool, error) {
+		err := catchPanic(func() error {
+			return wire(s.wireCtx, s)
+		})
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.started = true // no more shutdown handlers can be added
+		return s.Stopping(), err
+	}()
+
+	switch {
+	case stoppedDuringWiring && isStoppedCleanly(wireErr): // wire stopped as its ctx told it to
+		wireErr = nil
+	case wireErr != nil:
+		wireErr = fmt.Errorf("wiring failed: %w", wireErr)
+		s.requestStop(wireErr)
+	default:
+		s.loggerProvider.LifecycleInfo(s.runCtx, "started "+s.name)
+	}
+
+	// closed on a signal (SIGINT, SIGTERM or one added by WithStopSignals),
+	// shell.Stop(), Run's ctx cancelled, a Go function failing, or wire() failing
+	<-s.stopped
+
+	if !stoppedDuringWiring { // a stop during wiring logged its line as it arrived
+		s.loggerProvider.LifecycleInfo(s.runCtx, stoppingLine(s.stopReason))
+	}
+
+	if !slices.ContainsFunc(s.groups, func(group *shutdownGroup) bool {
+		return len(group.handlers) > 0
+	}) {
+		s.loggerProvider.LifecycleInfo(s.runCtx, "no components are registered for graceful shutdown")
+	}
+	s.awaitDrainDelay()
+
+	ctx, cancel := context.WithDeadline(s.runCtx, s.deadline())
+	defer cancel()
+	s.shutdown(ctx)
+
+	s.goCtxCancel(stopCause{s.deadline()}) // for Go functions not stopped before deadline
+	if s.wireCtx.Err() == nil {            // not already canceled
+		s.loggerProvider.LifecycleInfo(s.runCtx, "cancelling wire's ctx")
+		s.wireCtxCancel()
+	}
+
+	exitCode := cleanExitCode(s.stopReason)
+	if err := s.failures(s.stopReason, wireErr); err != nil {
+		s.loggerProvider.LifecycleError(s.runCtx, "stopped with an error", err)
 		exitCode = 1
 	}
-	s.loggerProvider.LifecycleInfo(s.detached, "exiting "+s.name)
+	s.loggerProvider.LifecycleInfo(s.runCtx, "exiting "+s.name) // the last line
 	return exitCode
 }
 
-// cleanExitCode is 128 plus the signal when a signal other than SIGTERM asked for the stop, as the
-// calling process expects of Ctrl+C (130), and 0 otherwise: SIGTERM is the platform's normal stop
-func (s *shell[C, L]) cleanExitCode() int {
-	received := stoppedBySignal(s.reason())
-	if received == nil || received == syscall.SIGTERM {
-		return 0
+// isStoppedCleanly reports whether wire's err is nil or wraps context.Canceled through single wraps
+// only. errors.Is is not used because it looks inside joined errors, which would hide a real failure
+// reported together with the cancellation.
+func isStoppedCleanly(err error) bool {
+	if err == nil {
+		return true
 	}
-	return signalExitCode(received)
+	for ; err != nil; err = errors.Unwrap(err) { // errors.Unwrap follows only Unwrap() error
+		if err == context.Canceled {
+			return true
+		}
+	}
+	return false
 }
 
-// callWire calls wire, turning a panic into its error so the handlers registered before it still run
-func (s *shell[C, L]) callWire(ctx context.Context, wire Wiring[C, L]) (err error) {
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			err = fmt.Errorf("wiring panicked: %v\n%s", recovered, debug.Stack())
-		}
-	}()
-	return wire(ctx, s)
+// cleanExitCode is 128 plus the signal for a signal other than kubernetesTermSignal, as the calling
+// process expects of Ctrl+C (130), and 0 otherwise
+func cleanExitCode(reason error) int {
+	received := stoppedBySignal(reason)
+	if received == nil || received == kubernetesTermSignal {
+		return 0
+	}
+	number, ok := received.(syscall.Signal)
+	if !ok {
+		return 1 // an os.Signal that is not a syscall.Signal has no number to report
+	}
+	return 128 + int(number) // the Unix convention for a process a signal ended
 }
 
 // Stop begins shutdown: a nil reason is a clean stop and any other makes Run return 1; the first

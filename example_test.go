@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"time"
 
 	"github.com/llingr/anvil"
 	"github.com/llingr/anvil/shutdown"
@@ -44,7 +45,6 @@ func (s stdLogging) LifecycleError(_ context.Context, msg string, err error) {
 func (s stdLogging) Flush() {
 }
 
-// OutboxShell keeps the two type parameters out of every function that takes the shell
 type OutboxShell = anvil.Shell[OutboxConfig, *log.Logger]
 
 func ExampleRun() {
@@ -61,13 +61,68 @@ func ExampleRun() {
 	// exit code 0
 }
 
-// wireOutbox registers the outbox's flush, then stops at once where a service would wait for SIGTERM
+// wireOutbox adds the outbox's flush, then stops at once where a service would wait for SIGTERM
 func wireOutbox(_ context.Context, shell OutboxShell) error {
 	batchSize := shell.Config().BatchSize
-	shell.RegisterShutdownHandler(shutdown.Egress, "outbox", func(context.Context) error {
+	shell.AddShutdownGroup(shutdown.Named("outbox", shutdown.HandlerFunc(func(context.Context) error {
 		fmt.Println("outbox flushed in batches of", batchSize)
 		return nil
-	})
+	})))
 	shell.Stop(nil)
 	return nil
+}
+
+func ExampleStopContext() {
+	loggerProvider := stdLogging{
+		logger: log.New(io.Discard, "", 0), // os.Stderr in a service
+	}
+	exitCode := anvil.Run(context.Background(), "server", OutboxConfig{}, loggerProvider, wireServer)
+	fmt.Println("exit code", exitCode)
+	// Output:
+	// stop context ended: false
+	// stop context has the shutdown deadline: true
+	// exit code 0
+}
+
+// wireServer starts the server's loop, then stops at once where a service would wait for SIGTERM
+func wireServer(_ context.Context, shell OutboxShell) error {
+	shell.AddShutdownGroup().SetName("SERVING").Go(serve)
+	shell.Stop(nil)
+	return nil
+}
+
+func ExampleWiring() {
+	loggerProvider := stdLogging{
+		logger: log.New(io.Discard, "", 0), // os.Stderr in a service
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // stands in for a SIGTERM during a slow start
+	exitCode := anvil.Run(ctx, "slow", OutboxConfig{}, loggerProvider, wireSlowly)
+	fmt.Println("exit code", exitCode)
+	// Output:
+	// wiring stopped: loading prices: context canceled
+	// exit code 0
+}
+
+// wireSlowly stands in for a start that takes a minute, and returns as soon as a stop cancels its ctx
+func wireSlowly(ctx context.Context, _ OutboxShell) error {
+	select {
+	case <-time.After(time.Minute):
+		return nil
+	case <-ctx.Done():
+		err := fmt.Errorf("loading prices: %w", ctx.Err())
+		fmt.Println("wiring stopped:", err)
+		return err // a clean stop, since nobody wants the start finished
+	}
+}
+
+// serve stands in for a server's loop: it serves until its ctx is cancelled, then stops on the stop ctx
+func serve(ctx context.Context) error {
+	<-ctx.Done() // told to stop
+	stopCtx, cancel := anvil.StopContext(ctx)
+	defer cancel()
+	_, hasDeadline := stopCtx.Deadline()
+	fmt.Println("stop context ended:", stopCtx.Err() != nil)
+	fmt.Println("stop context has the shutdown deadline:", hasDeadline)
+	return ctx.Err() // a clean stop
 }

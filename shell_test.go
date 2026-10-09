@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -47,41 +49,6 @@ func (n noConfig) Load(context.Context) (noConfig, error) {
 // testShell is the shell those providers make
 type testShell = anvil.Shell[noConfig, panickingLogger]
 
-// recorder keeps the start and end time of every handler that ran
-type recorder struct {
-	mu    sync.Mutex
-	spans map[string][2]time.Time
-}
-
-func newRecorder() *recorder {
-	return &recorder{
-		spans: map[string][2]time.Time{},
-	}
-}
-
-func (r *recorder) handler(name string, delay time.Duration) shutdown.Handler {
-	return func(context.Context) error {
-		r.mark(name, delay)
-		return nil
-	}
-}
-
-func (r *recorder) mark(name string, delay time.Duration) {
-	start := time.Now()
-	time.Sleep(delay)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.spans[name] = [2]time.Time{start, time.Now()}
-}
-
-func (r *recorder) startOf(name string) time.Time {
-	return r.spans[name][0]
-}
-
-func (r *recorder) endOf(name string) time.Time {
-	return r.spans[name][1]
-}
-
 type contextless struct {
 	called bool
 }
@@ -91,15 +58,20 @@ func (c *contextless) Shutdown() error {
 	return nil
 }
 
-// shutdownWithin splits total 50/25/25 across the phases with no drain, whose unused time would
-// otherwise reach the phases
+// shutdownWithin gives the shutdown one deadline of total, with no drain taking any of it
 func shutdownWithin(total time.Duration) []anvil.Option {
 	return []anvil.Option{
 		anvil.WithDrainDelay(0),
-		anvil.WithShutdownPhaseBudget(shutdown.Ingress, total*50/100),
-		anvil.WithShutdownPhaseBudget(shutdown.Core, total*25/100),
-		anvil.WithShutdownPhaseBudget(shutdown.Egress, total*25/100),
+		anvil.WithShutdownGracePeriod(total),
 	}
+}
+
+// goName is the name a group's Go gives its record in the log lines, kept here alone as it may change
+const goName = "go"
+
+// quick is a handler that returns nil at once
+func quick(context.Context) error {
+	return nil
 }
 
 // run wires and stops at once; a reported failure panics through panickingLogger
@@ -109,64 +81,6 @@ func run(wire func(shell testShell), options ...anvil.Option) {
 		shell.Stop(nil)
 		return nil
 	}, options...)
-}
-
-// Ingress and Egress run concurrently, Core runs in reverse registration order, phases run in order
-func TestPhaseOrderAndConcurrency(t *testing.T) {
-	rec := newRecorder()
-	run(func(shell testShell) {
-		shell.RegisterShutdownHandler(shutdown.Egress, "l1", rec.handler("l1", 50*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Egress, "l2", rec.handler("l2", 50*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Core, "n1", rec.handler("n1", 30*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Core, "n2", rec.handler("n2", 30*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Ingress, "e1", rec.handler("e1", 50*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Ingress, "e2", rec.handler("e2", 50*time.Millisecond))
-	}, shutdownWithin(5*time.Second)...)
-
-	if len(rec.spans) != 6 {
-		t.Fatalf("%d handlers ran, want 6", len(rec.spans))
-	}
-	if gap := rec.startOf("e2").Sub(rec.startOf("e1")).Abs(); gap > 20*time.Millisecond {
-		t.Errorf("early handlers started %s apart, want concurrent", gap)
-	}
-	if gap := rec.startOf("l2").Sub(rec.startOf("l1")).Abs(); gap > 20*time.Millisecond {
-		t.Errorf("late handlers started %s apart, want concurrent", gap)
-	}
-	if rec.startOf("n2").Before(rec.endOf("e1")) || rec.startOf("n2").Before(rec.endOf("e2")) {
-		t.Error("core started before ingress finished")
-	}
-	if rec.startOf("n1").Before(rec.endOf("n2")) {
-		t.Error("n1 started before n2 finished, want reverse registration order")
-	}
-	if rec.startOf("l1").Before(rec.endOf("n1")) {
-		t.Error("egress started before core finished")
-	}
-}
-
-// Each phase ends at the running total of budgets, so time Ingress does not use reaches Core and Egress
-func TestBudgetRollsForward(t *testing.T) {
-	var defaultBudget, lastBudget time.Duration
-	capture := func(into *time.Duration) shutdown.Handler {
-		return func(ctx context.Context) error {
-			deadline, _ := ctx.Deadline()
-			*into = time.Until(deadline)
-			return nil
-		}
-	}
-	run(func(shell testShell) {
-		shell.RegisterShutdownHandler(shutdown.Ingress, "early", newRecorder().handler("early", 300*time.Millisecond))
-		shell.RegisterShutdownHandler(shutdown.Core, "default budget", capture(&defaultBudget))
-		shell.RegisterShutdownHandler(shutdown.Egress, "last budget", capture(&lastBudget))
-	}, shutdownWithin(3*time.Second)...)
-
-	within := func(name string, got, want time.Duration) {
-		t.Helper()
-		if (got - want).Abs() > 150*time.Millisecond {
-			t.Errorf("%s budget %s, want about %s", name, got, want)
-		}
-	}
-	within("default", defaultBudget, 1950*time.Millisecond) // 1.5s first + 750ms default, less 300ms used
-	within("last", lastBudget, 2700*time.Millisecond)       // all 3s less 300ms, Core spent none
 }
 
 // A Stop reason wrapping context.Canceled is a failure, as any other reason is
@@ -204,7 +118,7 @@ func TestStopDoesNotBlock(t *testing.T) {
 func TestDefaultSignalsSurviveWithStopSignals(t *testing.T) {
 	plain := &contextless{}
 	anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
-		shell.RegisterShutdownHandler(shutdown.Core, "plain", shutdown.IgnoreContext(plain.Shutdown))
+		shell.AddShutdownGroup(shutdown.IgnoreContext(plain.Shutdown))
 		return raise(syscall.SIGTERM)
 	}, anvil.WithStopSignals(syscall.SIGHUP), anvil.WithDrainDelay(0))
 	if !plain.called {
@@ -213,19 +127,24 @@ func TestDefaultSignalsSurviveWithStopSignals(t *testing.T) {
 }
 
 // Wire's context is cancelled as shutdown starts, so its loops stop before any handler runs,
-// while each handler gets a live context of its own
+// while each handler gets a live context of its own. A Stop while wire runs cancels it before Stop
+// returns.
 func TestWiringContext(t *testing.T) {
-	var startDuringShutdown, handlerDuringShutdown error
+	var afterStop, startDuringShutdown, handlerDuringShutdown error
 	anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
-		shell.RegisterShutdownHandler(shutdown.Ingress, "observe", func(handlerCtx context.Context) error {
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(handlerCtx context.Context) error {
 			startDuringShutdown = ctx.Err()
 			handlerDuringShutdown = handlerCtx.Err()
 			return nil
-		})
+		}))
 		shell.Stop(nil)
+		afterStop = ctx.Err()
 		return nil
 	})
 
+	if afterStop != context.Canceled {
+		t.Fatalf("wire ctx as Stop returned %v, want cancelled", afterStop)
+	}
 	if !errors.Is(startDuringShutdown, context.Canceled) {
 		t.Fatalf("wire ctx in the first handler %v, want cancelled", startDuringShutdown)
 	}
@@ -244,11 +163,11 @@ func TestRootCancelStops(t *testing.T) {
 	var handlerDuringShutdown error
 	anvil.Run(root, "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
 		startTrace = ctx.Value(traceKey{})
-		shell.RegisterShutdownHandler(shutdown.Core, "observe", func(handlerCtx context.Context) error {
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(handlerCtx context.Context) error {
 			handlerTrace = handlerCtx.Value(traceKey{})
 			handlerDuringShutdown = handlerCtx.Err()
 			return nil
-		})
+		}))
 		cancel()
 		return nil
 	})
@@ -275,7 +194,7 @@ func TestSignalTrigger(t *testing.T) {
 	plain := &contextless{}
 	anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
 		err := raise(syscall.SIGHUP)
-		shell.RegisterShutdownHandler(shutdown.Core, "plain", shutdown.IgnoreContext(plain.Shutdown))
+		shell.AddShutdownGroup(shutdown.IgnoreContext(plain.Shutdown))
 		return err
 	}, anvil.WithStopSignals(syscall.SIGHUP), anvil.WithDrainDelay(0))
 	if !plain.called {
@@ -283,46 +202,132 @@ func TestSignalTrigger(t *testing.T) {
 	}
 }
 
-// A context-free Shutdown runs through IgnoreContext, and a closure is a Handler as it is
+// A context-free Shutdown runs through IgnoreContext, a close function through Close, and a closure
+// through HandlerFunc, all in one group without names of their own
 func TestShapes(t *testing.T) {
 	plain := &contextless{}
+	closed := false
 	ran := false
 	run(func(shell testShell) {
-		shell.RegisterShutdownHandler(shutdown.Core, "plain", shutdown.IgnoreContext(plain.Shutdown))
-		shell.RegisterShutdownHandler(shutdown.Core, "flush", func(context.Context) error {
-			ran = true
-			return nil
-		})
+		shell.AddShutdownGroup(
+			shutdown.IgnoreContext(plain.Shutdown),
+			shutdown.Close(func() {
+				closed = true
+			}),
+			shutdown.HandlerFunc(func(context.Context) error {
+				ran = true
+				return nil
+			}),
+		)
 	})
-	if !plain.called || !ran {
-		t.Fatalf("contextless %v, func %v", plain.called, ran)
+	if !plain.called || !closed || !ran {
+		t.Fatalf("contextless %v, close %v, func %v, want all called", plain.called, closed, ran)
 	}
 }
 
-// Wiring mistakes panic at the point of the mistake
-func TestRegisterPanics(t *testing.T) {
-	expectPanic := func(name string, do func()) {
-		t.Helper()
-		defer func() {
-			if recover() == nil {
-				t.Errorf("%s did not panic", name)
-			}
-		}()
-		do()
+// fakeServer is a handler with a pointer receiver, as *http.Server is
+type fakeServer struct{}
+
+func (*fakeServer) Shutdown(context.Context) error {
+	return nil
+}
+
+// names reports whether a panic message names value, as written or quoted
+func names(message, value string) bool {
+	return strings.Contains(message, value) || strings.Contains(message, strconv.Quote(value))
+}
+
+// Wiring mistakes panic at the call with the anvil: prefix, naming what is wrong and where, and
+// change nothing more: the faulty handler or function is not added. The group named PAYMENTS
+// already holds a valid handler, which still runs.
+func TestAddPanics(t *testing.T) {
+	const label = "shutdown group 1 (PAYMENTS)"
+	type addCase struct {
+		name     string
+		mistake  func(shell testShell, group anvil.ShutdownGroup)
+		mentions []string
 	}
-	anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
-		expectPanic("empty name", func() {
-			shell.RegisterShutdownHandler(shutdown.Core, "", shutdown.IgnoreContext((&contextless{}).Shutdown))
+	cases := []addCase{
+		{"a nil handler", func(_ testShell, group anvil.ShutdownGroup) {
+			group.Add(nil)
+		}, []string{"nil shutdown handler", label}},
+		{"a nil pointer handler", func(_ testShell, group anvil.ShutdownGroup) {
+			group.Add((*fakeServer)(nil))
+		}, []string{"nil shutdown handler", label}},
+		{"a nil HandlerFunc", func(_ testShell, group anvil.ShutdownGroup) {
+			group.Add(shutdown.HandlerFunc(nil))
+		}, []string{"nil shutdown handler", label}},
+		{"a nil handler at AddShutdownGroup", func(shell testShell, _ anvil.ShutdownGroup) {
+			shell.AddShutdownGroup(nil)
+		}, []string{"nil shutdown handler", "shutdown group 2"}},
+		{"a nil function to Go", func(_ testShell, group anvil.ShutdownGroup) {
+			group.Go(nil)
+		}, []string{"nil function", label}},
+		{"a group named twice", func(_ testShell, group anvil.ShutdownGroup) {
+			group.SetName("REFUNDS")
+		}, []string{"PAYMENTS", "REFUNDS"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var ran atomic.Bool
+			var recovered any
+			code := anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
+				defer shell.Stop(nil)
+				group := shell.AddShutdownGroup(shutdown.Named("outbox", shutdown.HandlerFunc(func(context.Context) error {
+					ran.Store(true)
+					return nil
+				}))).SetName("PAYMENTS")
+				defer func() {
+					recovered = recover()
+				}()
+				tc.mistake(shell, group)
+				return nil
+			}, anvil.WithDrainDelay(0))
+
+			if code != 0 {
+				t.Errorf("exit code %d, want 0", code)
+			}
+			if !ran.Load() {
+				t.Error("the valid handler added first never ran")
+			}
+			if recovered == nil {
+				t.Fatal("did not panic")
+			}
+			message := fmt.Sprint(recovered)
+			if !strings.HasPrefix(message, "anvil: ") {
+				t.Errorf("panic %q, want it to start %q", message, "anvil: ")
+			}
+			for _, named := range tc.mentions {
+				if !names(message, named) {
+					t.Errorf("panic %q, want it to name %q", message, named)
+				}
+			}
 		})
-		expectPanic("nil handler", func() {
-			shell.RegisterShutdownHandler(shutdown.Core, "nil", nil)
+	}
+}
+
+// No name is checked: shutdown.Named and SetName accept any text, empty, with spaces, the characters
+// the lines put around names, control characters or bad UTF-8. Each handler is added and run, and two
+// handlers of one name in one group both run.
+func TestAnyNameIsAccepted(t *testing.T) {
+	lineSeparator := string(rune(0x2028))
+	noBreakSpace := string(rune(0xa0))
+	odd := []string{"http server", "out-box", "café", "(x)", " ", "", "a->b", "[x]", "a;b", "a,b", "a\nb", "a\tb", lineSeparator, noBreakSpace, "\x00", "\x7f", "\xff"}
+	for _, name := range odd {
+		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {
+			var ran atomic.Int32
+			counted := shutdown.Named(name, shutdown.HandlerFunc(func(context.Context) error {
+				ran.Add(1)
+				return nil
+			}))
+			run(func(shell testShell) {
+				shell.AddShutdownGroup(counted, counted).SetName(name)
+			})
+			if ran.Load() != 2 {
+				t.Errorf("ran %d times, want both handlers named %q run", ran.Load(), name)
+			}
 		})
-		expectPanic("unknown phase", func() {
-			shell.RegisterShutdownHandler(shutdown.Phase("early"), "contextless", shutdown.IgnoreContext((&contextless{}).Shutdown))
-		})
-		shell.Stop(nil)
-		return nil
-	})
+	}
 }
 
 // recordingLogger keeps the error lines and reports "started", for tests that act once wire returns
@@ -365,52 +370,122 @@ func (r *recordingLogger) errorLines() []string {
 
 type recordedShell = anvil.Shell[noConfig, *recordingLogger]
 
-// A handler registered after wire returns is logged and left out, the process carries on, and the
-// handlers registered in time still run
-func TestRegisterAfterWiringIsRefused(t *testing.T) {
+// panickingConfig panics while loading, on Run's own goroutine, where only Run's deferred flush sees it
+type panickingConfig struct{}
+
+func (panickingConfig) Load(context.Context) (noConfig, error) {
+	panic("kaboom")
+}
+
+// flushCountingLogger records error lines and counts flushes
+type flushCountingLogger struct {
+	recordingLogger
+	flushes int
+}
+
+func (f *flushCountingLogger) Flush() {
+	f.flushes++
+}
+
+// A panic on Run's goroutine is logged and the logger flushed, then the panic carries on unchanged
+func TestPanicIsLoggedAndFlushedBeforeItCarriesOn(t *testing.T) {
+	logger := &flushCountingLogger{recordingLogger: *newRecordingLogger()}
+	defer func() {
+		recovered := recover()
+		if recovered != "kaboom" {
+			t.Fatalf("recovered %v, want the original panic", recovered)
+		}
+		if lines := logger.errorLines(); len(lines) != 1 || lines[0] != "panicked: kaboom" || logger.flushes != 1 {
+			t.Fatalf("errors %q, flushes %d, want the panic logged once and one flush", lines, logger.flushes)
+		}
+	}()
+	anvil.Run(context.Background(), "test", panickingConfig{}, logger,
+		func(ctx context.Context, shell anvil.Shell[noConfig, *recordingLogger]) error {
+			return nil
+		})
+}
+
+// Shell.Logger is the logger provider's own logger
+func TestLoggerIsTheProvidersLogger(t *testing.T) {
+	logger := newRecordingLogger()
+	var got *recordingLogger
+	code := anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
+		got = shell.Logger()
+		shell.Stop(nil)
+		return nil
+	})
+	if code != 0 || got != logger {
+		t.Fatalf("exit %d, logger %p, want 0 and the provider's %p", code, got, logger)
+	}
+}
+
+// Once wire has returned, every change to the shutdown groups is refused: logged once each, with
+// the process carrying on, nothing added, named or started, and the handler added in time still run.
+// A group AddShutdownGroup refuses refuses every change made to it in the same way.
+func TestChangesAfterWiringAreRefused(t *testing.T) {
 	logger := newRecordingLogger()
 	var shell recordedShell
-	ranEarly, ranLate := false, false
+	var early anvil.ShutdownGroup
+	var ranEarly, ranLate atomic.Bool
 	finished := make(chan int)
 	go func() {
 		finished <- anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, started recordedShell) error {
 			shell = started
-			shell.RegisterShutdownHandler(shutdown.Core, "early", func(context.Context) error {
-				ranEarly = true
+			early = shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
+				ranEarly.Store(true)
 				return nil
-			})
+			}))
 			return nil
 		})
 	}()
 	<-logger.started
-	shell.RegisterShutdownHandler(shutdown.Core, "late", func(context.Context) error {
-		ranLate = true
+	late := shutdown.HandlerFunc(func(context.Context) error {
+		ranLate.Store(true)
 		return nil
 	})
+	lateFn := func(context.Context) error {
+		ranLate.Store(true)
+		return nil
+	}
+	refusedGroup := shell.AddShutdownGroup(late)
+	refusedGroup.Add(late)
+	refusedGroup.Go(lateFn)
+	refusedGroup.SetName("LATE")
+	early.Add(late)
+	early.Go(lateFn)
+	early.SetName("EARLY")
 	shell.Stop(nil)
 
-	if code := <-finished; code != 0 || !ranEarly || ranLate {
-		t.Fatalf("exit %d, early ran %v, late ran %v, want 0, true, false", code, ranEarly, ranLate)
+	if code := <-finished; code != 0 || !ranEarly.Load() || ranLate.Load() {
+		t.Fatalf("exit %d, early ran %v, late ran %v, want 0, true, false", code, ranEarly.Load(), ranLate.Load())
 	}
-	const refused = `shutdown handler "late" not registered: registrations are only permitted during startup`
-	if lines := logger.errorLines(); len(lines) != 1 || !strings.HasPrefix(lines[0], refused) {
-		t.Fatalf("errors %q, want the refusal of late", lines)
+	const reason = ": shutdown groups can only be changed during wiring"
+	want := []string{
+		"shutdown group not added" + reason,
+		"shutdown handler not added" + reason,
+		"goroutine not started" + reason,
+		`shutdown group "LATE" not named` + reason,
+		"shutdown handler not added" + reason,
+		"goroutine not started" + reason,
+		`shutdown group "EARLY" not named` + reason,
+	}
+	if lines := logger.errorLines(); !slices.Equal(lines, want) {
+		t.Fatalf("errors\n%q\nwant\n%q", lines, want)
 	}
 }
 
-// Registration from a goroutine wire launched is refused once wire returns, without that goroutine
+// Adding from a goroutine wire launched is refused once wire returns, without that goroutine
 // synchronising with Run
-func TestRegisterFromAnotherGoroutineIsRefusedOnceWiringReturns(t *testing.T) {
+func TestAddFromAnotherGoroutineIsRefusedOnceWiringReturns(t *testing.T) {
 	logger := newRecordingLogger()
 	refused := make(chan bool, 1)
 	code := anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
+		group := shell.AddShutdownGroup()
 		go func() {
 			defer shell.Stop(nil)
 			giveUp := time.Now().Add(time.Second)
 			for time.Now().Before(giveUp) {
-				shell.RegisterShutdownHandler(shutdown.Core, "late", func(context.Context) error {
-					return nil
-				})
+				group.Add(shutdown.HandlerFunc(quick))
 				if len(logger.errorLines()) > 0 {
 					refused <- true
 					return
@@ -421,7 +496,7 @@ func TestRegisterFromAnotherGoroutineIsRefusedOnceWiringReturns(t *testing.T) {
 		return nil
 	})
 	if !<-refused {
-		t.Fatal("registration never refused after wire returned")
+		t.Fatal("add never refused after wire returned")
 	}
 	if code != 0 {
 		t.Fatalf("exit %d, want 0", code)
@@ -474,7 +549,7 @@ func TestRunReturnsExitCodes(t *testing.T) {
 	}
 	unloaded := anvil.Run(context.Background(), "test", quietConfig{err: errors.New("unreadable")}, quietLogger{}, notStarted)
 
-	// wire's own error is a failure, even one wrapping context.Canceled
+	// with no stop, a wire error wrapping context.Canceled is still a failure
 	startCancelled := anvil.Run(context.Background(), "test", quietConfig{}, quietLogger{}, func(context.Context, quietShell) error {
 		return fmt.Errorf("db: %w", context.Canceled)
 	})
@@ -550,20 +625,80 @@ func TestConfigLoggerNotCalledWhenTheLoadFails(t *testing.T) {
 }
 
 // A ctx already done when Run is called stops the application as soon as it starts, through the
-// usual shutdown, once a provider that ignores the ctx has loaded the configuration anyway
+// usual shutdown, once a provider that ignores the ctx has loaded the configuration anyway. The
+// stop cancels wire's ctx, so a wire waiting on it returns its error at once, which is clean, and
+// no started line is logged.
 func TestDoneCtxStopsAtOnce(t *testing.T) {
 	done, cancel := context.WithCancel(context.Background())
 	cancel()
 	flushed := false
 	code := anvil.Run(done, "test", quietConfig{}, quietLogger{}, func(ctx context.Context, shell quietShell) error {
-		shell.RegisterShutdownHandler(shutdown.Egress, "outbox", func(context.Context) error {
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
 			flushed = true
 			return nil
-		})
+		}))
 		return nil
 	})
 	if code != 0 || !flushed {
 		t.Fatalf("exit %d, outbox flushed %v, want 0 and the shutdown run", code, flushed)
+	}
+
+	logger := newRecordingLogger()
+	finished := make(chan int, 1)
+	go func() {
+		finished <- anvil.Run(done, "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
+			<-ctx.Done() // the stop lands from its own goroutine, before or after wire is called
+			return ctx.Err()
+		})
+	}()
+	select {
+	case code = <-finished:
+	case <-time.After(10 * time.Second):
+		t.Fatal("wire waiting on its ctx never returned: the done ctx's stop did not cancel it")
+	}
+	if code != 0 || len(logger.errorLines()) != 0 {
+		t.Fatalf("waiting wire exit %d, errors %q, want 0 and none", code, logger.errorLines())
+	}
+	select {
+	case <-logger.started:
+		t.Fatal("started logged, want none after a stop during wiring")
+	default:
+	}
+}
+
+// A Stop racing wire's return gets one rule or the other, so a wire that returns its ctx's error
+// always stops cleanly, and a wire that saw its ctx cancelled is never reported started. The
+// synctest tests pin each rule; this runs the race on real goroutines for -race to check the lock.
+// Wire spins a little longer each iteration, so the Stop lands before, around and after its return.
+func TestStopRacingWireReturn(t *testing.T) {
+	for iteration := range 200 {
+		logger := newRecordingLogger()
+		var sawStop bool
+		code := anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
+			go shell.Stop(nil)
+			for range iteration * iteration {
+				if ctx.Err() != nil {
+					break
+				}
+			}
+			err := ctx.Err()
+			sawStop = err != nil
+			if err != nil && iteration%2 == 1 {
+				return fmt.Errorf("db: %w", err)
+			}
+			return err
+		}, anvil.WithDrainDelay(0))
+
+		if code != 0 || len(logger.errorLines()) != 0 {
+			t.Fatalf("iteration %d: exit %d, errors %q, want 0 and none", iteration, code, logger.errorLines())
+		}
+		select {
+		case <-logger.started:
+			if sawStop {
+				t.Fatalf("iteration %d: started logged after wire saw its ctx cancelled", iteration)
+			}
+		default:
+		}
 	}
 }
 
@@ -572,16 +707,16 @@ func TestDoneCtxStopsAtOnce(t *testing.T) {
 func TestCleanStopExitCodeFollowsTheSignal(t *testing.T) {
 	exitCodeAfter := func(received syscall.Signal, handler shutdown.Handler) int {
 		return anvil.Run(context.Background(), "test", quietConfig{}, quietLogger{}, func(ctx context.Context, shell quietShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "handler", handler)
+			shell.AddShutdownGroup(handler)
 			return raise(received)
 		}, anvil.WithStopSignals(syscall.SIGHUP), anvil.WithDrainDelay(0))
 	}
-	clean := func(context.Context) error {
+	clean := shutdown.HandlerFunc(func(context.Context) error {
 		return nil
-	}
-	failing := func(context.Context) error {
+	})
+	failing := shutdown.HandlerFunc(func(context.Context) error {
 		return errors.New("flush failed")
-	}
+	})
 	if code, want := exitCodeAfter(syscall.SIGHUP, clean), 128+int(syscall.SIGHUP); code != want {
 		t.Errorf("SIGHUP clean stop exit %d, want %d", code, want)
 	}
@@ -627,10 +762,10 @@ func TestStopping(t *testing.T) {
 	var whileStarting, duringShutdown bool
 	anvil.Run(context.Background(), "test", noConfig{}, panickingLogger{}, func(ctx context.Context, shell testShell) error {
 		whileStarting = shell.Stopping()
-		shell.RegisterShutdownHandler(shutdown.Core, "observe", func(context.Context) error {
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
 			duringShutdown = shell.Stopping()
 			return nil
-		})
+		}))
 		shell.Stop(nil)
 		return nil
 	})

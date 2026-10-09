@@ -9,21 +9,19 @@
 //	exitCode := anvil.Run(context.Background(), "orders", configProvider, loggerProvider, wire)
 //	os.Exit(exitCode)
 //
-// Run loads the configuration, traps SIGINT and SIGTERM, and calls wire, which builds the
-// service's components, registers each one's shutdown handler in a phase and returns; it must not
-// block, and a handler registered after it returns is refused. Run then waits for a signal,
-// Shell.Stop or the cancellation of its ctx. After SIGTERM it keeps serving through the drain
-// delay (WithDrainDelay) while Kubernetes takes the pod out of its endpoints, and
-// Shell.Stopping turns true for a readiness probe. It then runs the phases in order within the
-// shutdown deadline (WithShutdownDeadline): shutdown.Ingress (consumers and servers, concurrently),
-// shutdown.Core (one at a time, in reverse registration order) and shutdown.Egress (publishers
-// and pools, concurrently).
+// Run loads the configuration and calls wire, which builds the service and adds what has to stop
+// to shutdown groups, then returns:
 //
-// Run returns 0 after a clean stop, 130 after a clean stop Ctrl+C asked for, and 1 after a failure it
-// has logged. A second SIGINT or SIGTERM ends the process at once.
+//	func wire(_ context.Context, shell anvil.Shell[Config, *zap.Logger]) error {
+//		server := &http.Server{Addr: ":8080"}
+//		shell.AddShutdownGroup(server).Go(func(context.Context) error {
+//			return server.ListenAndServe()
+//		})
+//		return nil
+//	}
 //
-// An alias keeps the two type parameters, the configuration type and the logger, out of every
-// function that takes the shell:
-//
-//	type Shell = anvil.Shell[Config, *zap.Logger]
+// Run then waits for SIGINT, SIGTERM, Shell.Stop or the cancellation of its ctx. Groups stop one
+// after another, in the order they were added, and everything in a group stops together. The whole
+// shutdown has one deadline, 28s by default (WithShutdownGracePeriod), and Run returns the exit
+// code: 0 after a clean stop, 130 after Ctrl+C, and 1 after a failure it has logged.
 package anvil
