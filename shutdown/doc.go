@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The anvil Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package shutdown defines the handlers a component shuts down through and the phases anvil runs
-// them in. Ingress and Egress run their handlers concurrently; Core runs its handlers one at a time,
-// in reverse registration order.
+// Package shutdown defines the handler a component shuts down through: anything with a
+// Shutdown(ctx) error method, as http.Server has, plus adapters for functions and Named for a
+// handler whose type does not name it.
 package shutdown

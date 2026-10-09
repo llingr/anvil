@@ -1,0 +1,4 @@
+app:
+  server:
+    port: 8080 # APP_SERVER_PORT overrides it
+    readHeaderTimeout: 5s

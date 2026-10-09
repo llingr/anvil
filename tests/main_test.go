@@ -9,7 +9,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"strings"
@@ -55,6 +58,19 @@ type chattyLogging struct {
 
 func (chattyLogging) LifecycleInfo(_ context.Context, msg string) {
 	log.Print(msg)
+}
+
+// readyLogging is chattyLogging that prints ready once Run logs started, so a signal sent on ready
+// arrives after wire has returned
+type readyLogging struct {
+	chattyLogging
+}
+
+func (r readyLogging) LifecycleInfo(ctx context.Context, msg string) {
+	r.chattyLogging.LifecycleInfo(ctx, msg)
+	if msg == "started test" {
+		fmt.Println("ready")
+	}
 }
 
 // brokenLogging panics as Run logs "exiting", outside wire, and reports its Flush on stderr
@@ -118,6 +134,9 @@ func neverStarted(context.Context, testShell) error {
 	return nil
 }
 
+// slowRequest is how long the http-server helper takes to answer a request
+const slowRequest = 500 * time.Millisecond
+
 // TestMain doubles as the child process for the exit code tests, selected by LIFECYCLE_HELPER
 func TestMain(m *testing.M) {
 	switch os.Getenv("LIFECYCLE_HELPER") {
@@ -130,18 +149,18 @@ func TestMain(m *testing.M) {
 		})
 	case "setup-error":
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "plain", func(context.Context) error {
+			shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
 				log.Print("plain ran")
 				return nil
-			})
+			}))
 			return errors.New("boom")
 		})
 	case "wiring-panic":
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "plain", func(context.Context) error {
+			shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
 				log.Print("plain ran")
 				return nil
-			})
+			}))
 			panic("kaboom")
 		})
 	case "run-panic":
@@ -163,25 +182,25 @@ func TestMain(m *testing.M) {
 		os.Exit(anvil.Run(context.Background(), "test", unloadableConfig{}, stderrLogging{}, neverStarted))
 	case "detach":
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "stuck", shutdown.IgnoreContext(func() error {
+			shell.AddShutdownGroup(shutdown.Named("stuck", shutdown.IgnoreContext(func() error {
 				select {}
-			}))
+			}))).SetName("CORE")
 			shell.Stop(nil)
 			return nil
 		},
 			anvil.WithDrainDelay(0),
-			anvil.WithShutdownPhaseBudget(shutdown.Ingress, 100*time.Millisecond),
-			anvil.WithShutdownPhaseBudget(shutdown.Core, 100*time.Millisecond),
-			anvil.WithShutdownPhaseBudget(shutdown.Egress, 100*time.Millisecond))
+			anvil.WithShutdownGracePeriod(300*time.Millisecond))
 	case "panic":
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "bad", func(context.Context) error {
-				panic("kaboom")
-			})
-			shell.RegisterShutdownHandler(shutdown.Core, "good", func(context.Context) error {
-				log.Print("good ran")
-				return nil
-			})
+			shell.AddShutdownGroup(
+				shutdown.Named("bad", shutdown.HandlerFunc(func(context.Context) error {
+					panic("kaboom")
+				})),
+				shutdown.Named("good", shutdown.HandlerFunc(func(context.Context) error {
+					log.Print("good ran")
+					return nil
+				})),
+			).SetName("CORE")
 			shell.Stop(nil)
 			return nil
 		})
@@ -205,16 +224,17 @@ func TestMain(m *testing.M) {
 			return errors.New("boom")
 		}))
 	case "late-wiring":
-		// Ingress's 3s ends 3s after the Stop, so wire returning 2.5s late leaves it half a second
+		// The 1s deadline ends 1s after the Stop, so wire returning 1.5s late finds it already spent
 		os.Exit(anvil.Run(context.Background(), "test", noConfig{}, chattyLogging{}, func(_ context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Ingress, "consumer", func(ctx context.Context) error {
+			shell.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(func(ctx context.Context) error {
+				log.Print("consumer ran")
 				<-ctx.Done()
 				return ctx.Err()
-			})
+			}))).SetName("INGRESS")
 			shell.Stop(nil)
-			time.Sleep(2500 * time.Millisecond)
+			time.Sleep(1500 * time.Millisecond)
 			return nil
-		}, anvil.WithDrainDelay(0), anvil.WithShutdownDeadline(6*time.Second)))
+		}, anvil.WithDrainDelay(0), anvil.WithShutdownGracePeriod(time.Second)))
 	case "stop-then-wiring-panic":
 		hostMain(func(ctx context.Context, shell testShell) error {
 			shell.Stop(nil)
@@ -228,9 +248,9 @@ func TestMain(m *testing.M) {
 		})
 	case "lifecycle-lines":
 		os.Exit(anvil.Run(context.Background(), "test", noConfig{}, chattyLogging{}, func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "orders", func(context.Context) error {
+			shell.AddShutdownGroup(shutdown.Named("orders", shutdown.HandlerFunc(func(context.Context) error {
 				return nil
-			})
+			}))).SetName("CORE")
 			shell.Stop(nil)
 			return nil
 		}))
@@ -242,17 +262,16 @@ func TestMain(m *testing.M) {
 		}))
 	case "block":
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "block", func(ctx context.Context) error {
+			shell.AddShutdownGroup(shutdown.Named("block", shutdown.HandlerFunc(func(ctx context.Context) error {
 				<-ctx.Done()
 				return ctx.Err()
-			})
+			}))).SetName("CORE")
+			shell.AddShutdownGroup().SetName("EGRESS")
 			fmt.Println("ready")
 			return nil
 		},
 			anvil.WithDrainDelay(0),
-			anvil.WithShutdownPhaseBudget(shutdown.Ingress, 200*time.Millisecond),
-			anvil.WithShutdownPhaseBudget(shutdown.Core, 100*time.Millisecond),
-			anvil.WithShutdownPhaseBudget(shutdown.Egress, 100*time.Millisecond))
+			anvil.WithShutdownGracePeriod(400*time.Millisecond))
 	case "signal-during-load":
 		os.Exit(anvil.Run(context.Background(), "test", readyHangingConfig{}, chattyLogging{}, neverStarted))
 	case "blocking-wiring":
@@ -261,37 +280,69 @@ func TestMain(m *testing.M) {
 			select {}
 		}))
 	case "drain", "drain-forced", "drain-sigint":
-		exitCode := anvil.Run(context.Background(), "test", noConfig{}, chattyLogging{}, func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Ingress, "http server", func(context.Context) error {
+		exitCode := anvil.Run(context.Background(), "test", noConfig{}, readyLogging{}, func(ctx context.Context, shell testShell) error {
+			shell.AddShutdownGroup(shutdown.Named("http server", shutdown.HandlerFunc(func(context.Context) error {
 				log.Printf("ingress ran, wire ctx %v", ctx.Err())
 				return nil
-			})
+			}))).SetName("INGRESS")
 			go func() {
 				for !shell.Stopping() { // a readiness probe's view
 					time.Sleep(10 * time.Millisecond)
 				}
 				log.Printf("not ready, wire ctx %v", ctx.Err())
 			}()
-			fmt.Println("ready")
 			return nil
 		}, anvil.WithDrainDelay(300*time.Millisecond))
 		os.Exit(exitCode)
+	case "sigterm-during-wiring", "sigint-during-wiring":
+		// a slow start: wire waits on its ctx, as a dial or a migration would, so the signal arrives
+		// while it runs
+		os.Exit(anvil.Run(context.Background(), "test", noConfig{}, chattyLogging{}, func(ctx context.Context, shell testShell) error {
+			shell.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(func(context.Context) error {
+				log.Print("consumer ran")
+				return nil
+			}))).SetName("INGRESS")
+			fmt.Println("ready")
+			<-ctx.Done()
+			log.Print("wire saw its ctx cancelled")
+			return ctx.Err()
+		}, anvil.WithDrainDelay(time.Second), anvil.WithShutdownGracePeriod(3*time.Second)))
 	case "stop-block":
 		// Stop starts the shutdown, so a signal arrives with the operator yet to ask once, and
-		// ready prints from inside the handler to put it squarely in the phase
+		// ready prints from inside the handler to put it squarely in the shutdown
 		hostMain(func(ctx context.Context, shell testShell) error {
-			shell.RegisterShutdownHandler(shutdown.Core, "block", func(ctx context.Context) error {
+			shell.AddShutdownGroup(shutdown.Named("block", shutdown.HandlerFunc(func(ctx context.Context) error {
 				fmt.Println("ready")
 				<-ctx.Done()
 				return ctx.Err()
-			})
+			}))).SetName("CORE")
 			shell.Stop(nil)
 			return nil
 		},
 			anvil.WithDrainDelay(0),
-			anvil.WithShutdownPhaseBudget(shutdown.Ingress, 200*time.Millisecond),
-			anvil.WithShutdownPhaseBudget(shutdown.Core, time.Second),
-			anvil.WithShutdownPhaseBudget(shutdown.Egress, 100*time.Millisecond))
+			anvil.WithShutdownGracePeriod(1300*time.Millisecond))
+	case "http-server":
+		// prints its address, then ready from inside a request, so the SIGTERM finds it in flight; no
+		// drain, so the server is stopped at once, by server.Shutdown in the group Serve's Go is in,
+		// which lets the request finish while Serve returns http.ErrServerClosed
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			log.Fatal(err)
+		}
+		server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Println("ready")
+			time.Sleep(slowRequest)
+			_, _ = fmt.Fprint(w, "finished") // a failed write shows as the test's wrong body
+		})}
+		fmt.Println(listener.Addr())
+		hostMain(func(ctx context.Context, shell testShell) error {
+			shell.AddShutdownGroup(server).Go(func(context.Context) error {
+				return server.Serve(listener)
+			})
+			return nil
+		},
+			anvil.WithDrainDelay(0),
+			anvil.WithShutdownGracePeriod(3*time.Second))
 	}
 }
 
@@ -309,6 +360,10 @@ func runMain(t *testing.T, helper string, signals ...syscall.Signal) (int, strin
 	if err = child.Start(); err != nil {
 		t.Fatal(err)
 	}
+	hung := time.AfterFunc(30*time.Second, func() {
+		_ = child.Process.Kill()
+	}) // a hung child fails, as 137
+	defer hung.Stop()
 	if len(signals) > 0 {
 		if line, _ := bufio.NewReader(stdout).ReadString('\n'); line != "ready\n" {
 			t.Fatalf("child printed %q before ready", line)
@@ -320,32 +375,100 @@ func runMain(t *testing.T, helper string, signals ...syscall.Signal) (int, strin
 			time.Sleep(50 * time.Millisecond)
 		}
 	}
-	err = child.Wait()
+	return waitExit(t, child), stderr.String()
+}
+
+// waitExit waits for child and returns its exit code
+func waitExit(t *testing.T, child *exec.Cmd) int {
+	t.Helper()
+	err := child.Wait()
 	var exit *exec.ExitError
 	if err != nil && !errors.As(err, &exit) {
 		t.Fatal(err)
 	}
 	if status, ok := child.ProcessState.Sys().(syscall.WaitStatus); ok && status.Signaled() {
-		return 128 + int(status.Signal()), stderr.String() // bash reports a signal's kill the same way
+		return 128 + int(status.Signal()) // bash reports a signal's kill the same way
 	}
-	return child.ProcessState.ExitCode(), stderr.String()
+	return child.ProcessState.ExitCode()
 }
 
-// Main exits 0 after a clean Stop, and 1 when wire fails, after running what was registered
+// An HTTP server run by Go with server.Shutdown as its stop finishes the request in flight at
+// SIGTERM, and its Serve returning http.ErrServerClosed is a clean stop, so the process exits 0
+func TestMainHTTPServerFinishesInFlightRequest(t *testing.T) {
+	child := exec.Command(os.Args[0])
+	child.Env = append(os.Environ(), "LIFECYCLE_HELPER=http-server")
+	var stderr bytes.Buffer
+	child.Stderr = &stderr
+	stdout, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = child.Process.Kill()
+	}() // a no-op once the child has exited
+
+	lines := bufio.NewReader(stdout)
+	addr, err := lines.ReadString('\n')
+	if err != nil {
+		t.Fatalf("child printed %q before its address: %v", addr, err)
+	}
+	type response struct {
+		status int
+		body   string
+		err    error
+	}
+	responded := make(chan response, 1)
+	go func() {
+		client := http.Client{Timeout: 10 * time.Second}
+		resp, err := client.Get("http://" + strings.TrimSpace(addr) + "/")
+		if err != nil {
+			responded <- response{err: err}
+			return
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close() // read to the end, so nothing is left to report
+		responded <- response{status: resp.StatusCode, body: string(body), err: err}
+	}()
+	if line, err := lines.ReadString('\n'); line != "ready\n" {
+		t.Fatalf("child printed %q before the request was in flight: %v", line, err)
+	}
+	signalled := time.Now()
+	if err = child.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	got := <-responded
+	code := waitExit(t, child)
+	if elapsed := time.Since(signalled); elapsed > 6*time.Second {
+		t.Errorf("exit %s after the SIGTERM, want within twice the 3s deadline", elapsed)
+	}
+	if got.err != nil || got.status != http.StatusOK || got.body != "finished" {
+		t.Errorf("in-flight request got %d %q, error %v, want 200 finished", got.status, got.body, got.err)
+	}
+	if code != 0 || stderr.Len() != 0 {
+		t.Errorf("exit %d: %s, want 0 and nothing reported", code, stderr.String())
+	}
+}
+
+// Main exits 0 after a clean Stop, and 1 when wire fails, after running what was added
 func TestMainExitCodes(t *testing.T) {
 	if code, output := runMain(t, "clean"); code != 0 || strings.Contains(output, "stopped with an error") {
 		t.Fatalf("clean exit %d: %s", code, output)
 	}
 	code, output := runMain(t, "setup-error")
-	if code != 1 || !strings.Contains(output, "boom") || !strings.Contains(output, "plain ran") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: wiring failed: boom\n") || !strings.Contains(output, "plain ran") {
 		t.Fatalf("setup error exit %d: %s", code, output)
 	}
 }
 
-// A panicking wire is logged as an error, after running what it registered, and exits 1
+// A panicking wire is logged as an error, after running what it added, and exits 1
 func TestMainWiringPanic(t *testing.T) {
 	code, output := runMain(t, "wiring-panic")
-	if code != 1 || !strings.Contains(output, "wiring panicked: kaboom") || !strings.Contains(output, "plain ran") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: wiring failed: panic: kaboom\ngoroutine ") ||
+		!strings.Contains(output, "plain ran") || strings.Contains(output, "panicked") {
 		t.Fatalf("wiring panic exit %d: %s", code, output)
 	}
 }
@@ -399,22 +522,23 @@ func TestMainConfigError(t *testing.T) {
 	}
 }
 
-// A contextless handler still running at the deadline fails and is left behind
+// A contextless handler still running at the shutdown deadline is named in the deadline error and
+// left running
 func TestMainDetachesAtDeadline(t *testing.T) {
 	start := time.Now()
 	code, output := runMain(t, "detach")
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("exit took %s, want exit at the deadline", elapsed)
 	}
-	if code != 1 || !strings.Contains(output, "CORE stuck: context deadline exceeded") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: shutdown deadline 300ms passed: group 1 (CORE) stuck\n") {
 		t.Fatalf("detach exit %d: %s", code, output)
 	}
 }
 
-// A panicking handler becomes an error and the next one still runs
+// A panicking handler becomes an error and the one beside it still runs
 func TestMainPanicRecovered(t *testing.T) {
 	code, output := runMain(t, "panic")
-	if code != 1 || !strings.Contains(output, "CORE bad: panic: kaboom") || !strings.Contains(output, "good ran") {
+	if code != 1 || !strings.Contains(output, "group 1 (CORE) bad: panic: kaboom") || !strings.Contains(output, "good ran") {
 		t.Fatalf("panic exit %d: %s", code, output)
 	}
 }
@@ -422,38 +546,56 @@ func TestMainPanicRecovered(t *testing.T) {
 // A wiring error or panic is reported even when a stop was already under way and took the reason
 func TestMainWiringFailureAfterStopIsReported(t *testing.T) {
 	code, output := runMain(t, "stop-then-wiring-error")
-	if code != 1 || !strings.Contains(output, "stopped with an error: boom") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: wiring failed: boom\n") {
 		t.Fatalf("wiring error after stop exit %d: %s", code, output)
 	}
 	code, output = runMain(t, "stop-then-wiring-panic")
-	if code != 1 || !strings.Contains(output, "wiring panicked: kaboom") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: wiring failed: panic: kaboom\ngoroutine ") {
 		t.Fatalf("wiring panic after stop exit %d: %s", code, output)
 	}
 }
 
-// The "stopping:" line names the stop that won, not wiring failing after it
+// The "stopping:" line names the stop that won, not wiring failing after it, which the error reports
+// after the stop's own reason
 func TestMainStoppingLineNamesTheFirstTrigger(t *testing.T) {
 	code, output := runMain(t, "stop-then-wiring-error-logged")
-	if code != 1 || !strings.Contains(output, "stopping: Stop called\n") || strings.Contains(output, "wiring failed") {
+	if code != 1 || stoppingLine(output) != "stopping: Stop called, waiting for wire to return" ||
+		!strings.Contains(output, "stopped with an error: wiring failed: boom\n") {
 		t.Fatalf("Stop then wiring error exit %d: %s", code, output)
 	}
 	code, output = runMain(t, "cancel-then-wiring-error-logged")
-	if code != 1 || !strings.Contains(output, "stopping: the ctx passed to Run was cancelled: lease lost") ||
-		strings.Contains(output, "wiring failed") {
+	if code != 1 || stoppingLine(output) != "stopping: the ctx passed to Run was cancelled: lease lost, waiting for wire to return" ||
+		!strings.Contains(output, "stopped with an error: the ctx passed to Run was cancelled: lease lost\nwiring failed: boom\n") {
 		t.Fatalf("cancel then wiring error exit %d: %s", code, output)
 	}
 }
 
-// The shutdown deadline runs from the stop, so a wire that returns late leaves the phases less time
-// rather than pushing the shutdown past the grace period
+// stoppingLine is the output's one line starting "stopping:", without the log's timestamp, or a
+// note of how many there were
+func stoppingLine(output string) string {
+	var found []string
+	for _, logged := range strings.Split(output, "\n") {
+		if _, after, ok := strings.Cut(logged, " stopping: "); ok {
+			found = append(found, "stopping: "+after)
+		}
+	}
+	if len(found) != 1 {
+		return fmt.Sprintf("%d stopping lines", len(found))
+	}
+	return found[0]
+}
+
+// The shutdown deadline runs from the stop, so a wire that returns after it has passed leaves the
+// groups no time: no handler is called, and the shutdown does not run past the grace period
 func TestMainLateWiringKeepsTheDeadline(t *testing.T) {
 	start := time.Now()
 	code, output := runMain(t, "late-wiring")
-	if elapsed := time.Since(start); elapsed > 4500*time.Millisecond {
-		t.Fatalf("exit took %s, want Ingress ended 3s after the stop, not 3s after wire returned", elapsed)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("exit took %s, want the deadline kept from the stop, not restarted when wire returned", elapsed)
 	}
-	if code != 1 || !strings.Contains(output, "INGRESS consumer: context deadline exceeded") {
-		t.Fatalf("late wiring exit %d: %s", code, output)
+	if code != 1 || strings.Contains(output, "consumer ran") || strings.Contains(output, "shutdown group") ||
+		!strings.Contains(output, "stopped with an error: shutdown deadline 1s passed before group 1 (INGRESS) consumer\n") {
+		t.Fatalf("late wiring exit %d, want 1 with no handler called: %s", code, output)
 	}
 }
 
@@ -474,36 +616,73 @@ func TestMainRootCancelCauseIsReported(t *testing.T) {
 	}
 }
 
-// anvil logs its lifecycle in order: starting, the configuration's load time, what stopped it, each
-// phase that ran with its handlers' times, then exiting
+// anvil logs its lifecycle in order: starting, the configuration's load time, what stopped it,
+// each group as it begins, each handler with its time as it returns, then exiting. Wire stops the
+// application itself, so no started line is logged.
 func TestMainLifecycleLines(t *testing.T) {
 	code, output := runMain(t, "lifecycle-lines")
-	if code != 0 || !inOrder(output, "starting test", "loading config", "configuration loaded in ", "started test", "stopping: Stop called",
-		"CORE done in ", ": orders ", "exiting test") {
+	if code != 0 || strings.Contains(output, "pausing") || strings.Contains(output, "started test") ||
+		!inOrder(output, "starting test", "loading config", "configuration loaded in ",
+			"stopping: Stop called", "shutdown group 1 (CORE) with orders\n", "shutdown group 1 (CORE): orders done in ",
+			"exiting test") {
 		t.Fatalf("lifecycle exit %d: %s", code, output)
 	}
 }
 
-// A signal starts the drain: wire's ctx stays live and Ingress waits until the delay ends
+// A signal starts the drain: Ingress waits until the delay ends, and wire's ctx stays live through it
 func TestMainDrainDelay(t *testing.T) {
 	start := time.Now()
 	code, output := runMain(t, "drain", syscall.SIGTERM)
 	if elapsed := time.Since(start); elapsed < 300*time.Millisecond {
 		t.Fatalf("exit after %s, want the 300ms drain first", elapsed)
 	}
-	if code != 0 || !inOrder(output, "stopping: terminated signal received", "draining for 300ms before INGRESS",
-		"ingress ran, wire ctx context canceled", "INGRESS done in ") || !strings.Contains(output, "not ready, wire ctx <nil>") {
+	if code != 0 || !inOrder(output, "stopping: terminated signal received", "pausing for ", "ms before shutdown\n",
+		"shutdown group 1 (INGRESS) with http server\n", "ingress ran, wire ctx <nil>",
+		"shutdown group 1 (INGRESS): http server done in ") || !strings.Contains(output, "not ready, wire ctx <nil>") {
 		t.Fatalf("drain exit %d: %s", code, output)
 	}
 }
 
-// Ctrl+C runs the shutdown as Stop does, phases and all, but skips the drain's wait, and exits 130
+// Ctrl+C runs the shutdown as Stop does, groups and all, but skips the drain's wait, and exits 130
 // as the calling process expects of an interrupt
 func TestMainSigintSkipsTheDrain(t *testing.T) {
 	code, output := runMain(t, "drain-sigint", syscall.SIGINT)
-	if code != 130 || strings.Contains(output, "draining") ||
-		!inOrder(output, "stopping: interrupt signal received", "ingress ran", "INGRESS done in ") {
+	if code != 130 || strings.Contains(output, "pausing") ||
+		!inOrder(output, "stopping: interrupt signal received", "shutdown group 1 (INGRESS) with http server\n", "ingress ran",
+			"shutdown group 1 (INGRESS): http server done in ") {
 		t.Fatalf("sigint exit %d: %s", code, output)
+	}
+}
+
+// A SIGTERM during a slow start cancels wire's ctx at once, so wire returns its ctx's error, a
+// clean stop: the rest of the drain runs, then the handlers wire added, and the process exits 0
+// with no started line and nothing reported
+func TestMainSigtermDuringWiringExitsClean(t *testing.T) {
+	start := time.Now()
+	code, output := runMain(t, "sigterm-during-wiring", syscall.SIGTERM)
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("exit took %s, want well within three times the 3s deadline", elapsed)
+	}
+	if code != 0 || strings.Contains(output, "started test") || strings.Contains(output, "stopped with an error") ||
+		!inOrder(output, "stopping: terminated signal received, waiting for wire to return\n", "wire saw its ctx cancelled",
+			"pausing for ", " before shutdown\n",
+			"shutdown group 1 (INGRESS) with consumer\n", "consumer ran", "shutdown group 1 (INGRESS): consumer done in ",
+			"exiting test") {
+		t.Fatalf("sigterm during wiring exit %d: %s", code, output)
+	}
+	if !inOrder(output, "wire saw its ctx cancelled", "pausing for ") {
+		t.Fatalf("wire returned before seeing its ctx cancelled: %s", output)
+	}
+}
+
+// Ctrl+C during a slow start is as clean, with no drain, and exits 130
+func TestMainSigintDuringWiringExits130(t *testing.T) {
+	code, output := runMain(t, "sigint-during-wiring", syscall.SIGINT)
+	if code != 130 || strings.Contains(output, "pausing") || strings.Contains(output, "started test") ||
+		strings.Contains(output, "stopped with an error") ||
+		!inOrder(output, "stopping: interrupt signal received, waiting for wire to return\n", "wire saw its ctx cancelled",
+			"shutdown group 1 (INGRESS) with consumer\n", "consumer ran", "exiting test") {
+		t.Fatalf("sigint during wiring exit %d: %s", code, output)
 	}
 }
 
@@ -518,15 +697,17 @@ func TestMainSignalDuringLoad(t *testing.T) {
 	}
 }
 
-// A wire that blocks cannot hold the process: the second signal ends it
+// A wire that blocks cannot hold the process: the stopping line says the shutdown is waiting for
+// wire, and the second signal ends it
 func TestMainBlockingWiringIsKilled(t *testing.T) {
 	code, output := runMain(t, "blocking-wiring", syscall.SIGTERM, syscall.SIGTERM)
-	if code != 143 || strings.Contains(output, "exiting test") {
+	if code != 143 || strings.Contains(output, "exiting test") ||
+		!strings.Contains(output, "stopping: terminated signal received, waiting for wire to return\n") {
 		t.Fatalf("blocking wiring exit %d: %s", code, output)
 	}
 }
 
-// A second signal during the drain ends the process, as it does during the phases
+// A second signal during the drain ends the process, as it does during the groups
 func TestMainDrainDelaySecondSignalKills(t *testing.T) {
 	code, output := runMain(t, "drain-forced", syscall.SIGTERM, syscall.SIGTERM)
 	if code != 143 || strings.Contains(output, "ingress ran") || strings.Contains(output, "exiting test") {
@@ -547,10 +728,11 @@ func inOrder(output string, fragments ...string) bool {
 	return true
 }
 
-// One SIGTERM shuts down through the phases; a second ends the process at once, 128+15 as bash reports it
+// One SIGTERM shuts down through the groups; a second ends the process at once, 128+15 as bash reports it
 func TestMainSignals(t *testing.T) {
 	code, output := runMain(t, "block", syscall.SIGTERM)
-	if code != 1 || !strings.Contains(output, "deadline exceeded") {
+	// the whole error is the deadline's, so block is not reported failing with its ctx's error
+	if code != 1 || !strings.Contains(output, "stopped with an error: shutdown deadline 400ms passed: group 1 (CORE) block\n") {
 		t.Fatalf("single SIGTERM exit %d: %s", code, output)
 	}
 	code, output = runMain(t, "block", syscall.SIGTERM, syscall.SIGTERM)
@@ -560,10 +742,10 @@ func TestMainSignals(t *testing.T) {
 }
 
 // A Stop already shutting down takes the first SIGTERM as joining it, so a pod that stops itself as the
-// kubelet's SIGTERM arrives still gets its phases; a second SIGTERM ends the process
+// kubelet's SIGTERM arrives still gets its groups; a second SIGTERM ends the process
 func TestMainSignalsDuringStopTriggeredShutdown(t *testing.T) {
 	code, output := runMain(t, "stop-block", syscall.SIGTERM)
-	if code != 1 || !strings.Contains(output, "deadline exceeded") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: shutdown deadline 1.3s passed: group 1 (CORE) block\n") {
 		t.Fatalf("single SIGTERM after Stop exit %d: %s", code, output)
 	}
 	code, output = runMain(t, "stop-block", syscall.SIGTERM, syscall.SIGTERM)

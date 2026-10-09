@@ -8,43 +8,30 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
-	"strings"
-	"sync"
-	"syscall"
 	"time"
-
-	"github.com/llingr/anvil/shutdown"
 )
 
-// shutdown waits for a stop, drains if a SIGTERM asked, cancels wire's ctx, then runs the
-// phases within the shutdown deadline
-func (s *shell[C, L]) shutdown(cancelWire context.CancelFunc) error {
-	cause := s.reason()
-	stopping := "Stop called"
-	if cause != nil {
-		stopping = cause.Error()
+// awaitDrainDelay waits out the drain delay while the service keeps serving
+func (s *shell[C, L]) awaitDrainDelay() {
+	if stoppedBySignal(s.stopReason) != kubernetesTermSignal {
+		return
 	}
-	s.loggerProvider.LifecycleInfo(s.detached, "stopping: "+stopping)
-	var failures []error
-	if !cleanStop(cause) {
-		failures = append(failures, cause)
-	}
-
-	// SIGTERM is Kubernetes taking the pod out of its endpoints, so keep serving meanwhile. Ctrl+C
-	// (SIGINT), Stop and a cancelled ctx skip only the wait: the phases still run, so servers and
-	// pools close properly on a developer's machine too, and the drain's time goes to the phases.
-	drainEnd := s.shutdownTime().Add(s.options.drainDelay)
-	if drainLeft := time.Until(drainEnd); stoppedBySignal(cause) == syscall.SIGTERM && drainLeft > 0 {
-		s.loggerProvider.LifecycleInfo(s.detached, fmt.Sprintf("draining for %s before %s", drainLeft.Round(time.Millisecond), shutdown.Ingress))
+	drainLeft := time.Until(s.stoppedTime.Add(s.options.drainDelay))
+	if drainLeft > 0 {
+		const pauseMessage = "pausing for %s before shutdown"
+		s.loggerProvider.LifecycleInfo(s.runCtx, fmt.Sprintf(pauseMessage, drainLeft.Round(time.Millisecond)))
 		time.Sleep(drainLeft) // a second signal will exit immediately
 	}
-	cancelWire() // wire's loops stop before the handlers close what they use
-	return errors.Join(append(failures, s.runPhases(drainEnd)...)...)
 }
 
-// cleanStop is a stop asked for by a signal, Stop(nil), or cancelling Run's ctx without a cause
-func cleanStop(cause error) bool {
-	return cause == nil || cause == errRunCtxCancelled || stoppedBySignal(cause) != nil
+// deadline is the time the shutdown ends, counted from the stop
+func (s *shell[C, L]) deadline() time.Time {
+	return s.stoppedTime.Add(s.options.shutdownDeadline)
+}
+
+// isExpired reports whether the deadline had been reached at the time at
+func isExpired(deadline, at time.Time) bool {
+	return !at.Before(deadline)
 }
 
 // errRunCtxCancelled is the reason when the ctx passed to Run is cancelled
@@ -55,132 +42,84 @@ func (s *shell[C, L]) requestStop(reason error) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var isFirst bool
 	select {
 	case <-s.stopped:
-		isFirst = false // idempotent indicator
+		return false
 	default:
-		isFirst = true
-		s.stopReason = reason
-		s.stoppedTime = time.Now()
-		close(s.stopped)
 	}
-	return isFirst
+	s.stopReason = reason
+	s.stoppedTime = time.Now()
+	if !s.started {
+		// logged under the lock, so it comes before anything run logs once wire returns, and a wire
+		// that never returns still shows why the process went quiet
+		s.loggerProvider.LifecycleInfo(s.runCtx, stoppingLine(reason)+", waiting for wire to return")
+		s.wireCtxCancel() // a stop before or during wiring: wire returns rather than finishing a start nobody wants
+	}
+	close(s.stopped) // after wire's ctx, so nothing sees Stopping() while wire's ctx is still live
+	return true
 }
 
-// reason for shutdown, nil for a clean Stop(nil)
-func (s *shell[C, L]) reason() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stopReason
+// stoppingLine is the line logged as the shutdown begins, naming its reason
+func stoppingLine(reason error) string {
+	if reason == nil {
+		return "stopping: Stop called"
+	}
+	return "stopping: " + reason.Error()
 }
 
-// shutdownTime when the (first) stop arrived; phased
-// drains and theirs deadlines count from this point.
-func (s *shell[C, L]) shutdownTime() time.Time {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.stoppedTime
-}
-
-// runPhases ends each phase at the running total of budgets from the drain's end, so time a phase
-// leaves unused, and a drain that did not run, carries forward to the next
-func (s *shell[C, L]) runPhases(drainEnd time.Time) []error {
-	var failures []error
-	deadline := drainEnd
-	for _, phase := range shutdown.Phases() {
-		deadline = deadline.Add(s.options.shutdownBudgets[phase])
-		s.endPhaseCtx[phase]() // Go's loops for this phase stop taking work
-		failures = append(failures, s.shutdownPhase(phase, deadline)...)
-	}
-	return failures
-}
-
-func (s *shell[C, L]) shutdownPhase(phase shutdown.Phase, deadline time.Time) []error {
-	registeredHandlers := func() []registeredHandler {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		return s.shutdownHandlers[phase]
-	}()
-
-	ctx, cancel := context.WithDeadline(s.detached, deadline)
-	defer cancel()
-	start := time.Now()
-	failures := make([]error, len(registeredHandlers))
-	took := make([]time.Duration, len(registeredHandlers))
-	timed := func(index int) {
-		if ctx.Err() != nil { // an overrunning handler or a late wire used the phase's time
-			failures[index] = fmt.Errorf("%s %s: %w", phase, registeredHandlers[index].name, errSkipped)
-			return
-		}
-		handlerStart := time.Now()
-		failures[index] = invoke(ctx, phase, registeredHandlers[index])
-		took[index] = time.Since(handlerStart)
-	}
-	if phase == shutdown.Core {
-		for index := len(registeredHandlers) - 1; index >= 0; index-- { // reverse, as defer runs
-			timed(index)
-		}
-	} else {
-		var pending sync.WaitGroup
-		for index := range registeredHandlers {
-			pending.Go(func() {
-				timed(index)
-			})
-		}
-		pending.Wait()
-	}
-	if len(registeredHandlers) > 0 {
-		s.loggerProvider.LifecycleInfo(s.detached, phaseSummary(phase, time.Since(start), registeredHandlers, took, failures))
-	}
-	return failures
-}
-
-// errSkipped indicates a handler not started because an
-// overrunning handler had used up its phase's deadline.
-var errSkipped = errors.New("skipped, the phase's deadline had passed")
-
-// phaseSummary reads "CORE done in 5.7s: orders skipped, ledger failed after 5.7s, outbox 2ms"
-func phaseSummary(phase shutdown.Phase, elapsed time.Duration, handlers []registeredHandler, took []time.Duration, failures []error) string {
-	parts := make([]string, len(handlers))
-	for index, registered := range handlers {
-		switch {
-		case errors.Is(failures[index], errSkipped):
-			parts[index] = registered.name + " skipped"
-		case failures[index] != nil:
-			parts[index] = fmt.Sprintf("%s failed after %s", registered.name, took[index].Truncate(time.Microsecond))
-		default:
-			parts[index] = fmt.Sprintf("%s %s", registered.name, took[index].Truncate(time.Microsecond))
-		}
-	}
-	return fmt.Sprintf("%s done in %s: %s", phase, elapsed.Truncate(time.Microsecond), strings.Join(parts, ", "))
-}
-
-// invoke runs the handler and returns when the handler returns or the phase
-// deadline passes. If the deadline passes first, the handler is abandoned but
-// keeps running in the background.
-func invoke(ctx context.Context, phase shutdown.Phase, registered registeredHandler) error {
-	done := make(chan error, 1)
-	go func() {
-		defer func() {
-			if recovered := recover(); recovered != nil {
-				done <- fmt.Errorf("panic: %v\n%s", recovered, debug.Stack())
+// shutdown runs the groups in order; each handler's call refuses it once the deadline has passed
+func (s *shell[C, L]) shutdown(ctx context.Context) {
+	for _, group := range s.groups {
+		if !isExpired(s.deadline(), time.Now()) {
+			names := "no handlers"
+			if len(group.handlers) > 0 {
+				names = group.handlers[0].name
+				for _, handler := range group.handlers[1:] {
+					names += ", " + handler.name
+				}
 			}
-		}()
-		done <- registered.shutdownHandler(ctx)
+			s.loggerProvider.LifecycleInfo(s.runCtx, fmt.Sprintf("shutdown %s with %s", group.label(), names))
+		}
+		group.runHandlers(ctx) // each handler logs its own line as it returns
+	}
+}
+
+// catchPanic calls fn, returning a panic as "panic: <value>" and the stack. On runtime.Goexit it
+// does not return.
+func catchPanic(fn func() error) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = fmt.Errorf("panic: %v\n%s", recovered, debug.Stack())
+		}
 	}()
-	var err error
-	select {
-	case err = <-done:
-	case <-ctx.Done():
-		select {
-		case err = <-done:
-		default:
-			err = ctx.Err()
+	return fn()
+}
+
+// failures joins, in append order, the stop reason when it is an error, wire's error unless it is
+// the reason, the handlers' errors in the order they were added across groups in group order, and
+// the deadline error
+func (s *shell[C, L]) failures(reason, wireErr error) error {
+	var failures []error
+	// a signal, Stop(nil) and cancelling Run's ctx without a cause are clean stops; any other reason failed
+	if reason != nil && reason != errRunCtxCancelled && stoppedBySignal(reason) == nil {
+		failures = append(failures, reason)
+	}
+	if wireErr != nil && wireErr != reason {
+		failures = append(failures, wireErr)
+	}
+	unfinished := false
+	for _, group := range s.groups {
+		for _, handler := range group.handlers {
+			if handler.err != nil {
+				failures = append(failures, fmt.Errorf("%s %s: %w", group.label(), handler.name, handler.err))
+			}
+			if handler.returned.IsZero() { // never called, or still running at the deadline
+				unfinished = true
+			}
 		}
 	}
-	if err != nil {
-		return fmt.Errorf("%s %s: %w", phase, registered.name, err)
+	if unfinished {
+		failures = append(failures, deadlineError(s.options.shutdownDeadline, s.groups))
 	}
-	return nil
+	return errors.Join(failures...)
 }
