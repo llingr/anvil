@@ -5,6 +5,7 @@ package anvil
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 )
@@ -14,7 +15,7 @@ import (
 func deadlineError(deadline time.Duration, groups []*shutdownGroup) error {
 	var running []string
 	var neverCalled string
-	for _, group := range groups {
+	for _, group := range slices.Backward(groups) {
 		for _, handler := range group.handlers {
 			switch {
 			case handler.isRunning():

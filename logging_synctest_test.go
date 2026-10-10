@@ -81,7 +81,9 @@ func loggedAt(t *testing.T, lines []line, msg string, stopAt time.Time) time.Dur
 
 // wireTheExample adds the example service's seven groups, each handler taking its time from the
 // example, with replace overriding any by name, and stops with a SIGTERM once wire has returned.
-// The http server is a Go function that, told to stop, takes 312ms to stop serving.
+// The groups are added in the order the service opens what they stop, so they stop in reverse:
+// INGRESS_HTTP, added last, stops first. The http server is a Go function that, told to stop, takes
+// 312ms to stop serving.
 func wireTheExample(replace map[string]shutdown.HandlerFunc, stopped *<-chan time.Time) Wiring[struct{}, struct{}] {
 	handler := func(name string, delay time.Duration, err error) shutdown.Handler {
 		if replaced, ok := replace[name]; ok {
@@ -90,46 +92,46 @@ func wireTheExample(replace map[string]shutdown.HandlerFunc, stopped *<-chan tim
 		return shutdown.Named(name, sleepsThen(delay, err))
 	}
 	return func(_ context.Context, sh bubbleShell) error {
-		sh.AddShutdownGroup().SetName("INGRESS_HTTP").Go(func(ctx context.Context) error {
-			<-ctx.Done()
-			time.Sleep(312 * time.Millisecond)
-			return ctx.Err()
-		})
+		sh.AddShutdownGroup(handler("linkerd", 1100*time.Millisecond, nil)).SetName("SERVICE_MESH")
 		sh.AddShutdownGroup(
-			handler("orders consumer", 1104*time.Millisecond, nil),
-			handler("refunds consumer", 870*time.Millisecond, nil),
-		).SetName("INGRESS_CONSUMERS")
+			handler("postgres", 12*time.Millisecond, nil),
+			handler("dynamo", 15*time.Millisecond, nil),
+		).SetName("DB_POOLS")
+		sh.AddShutdownGroup(handler("kafka", 80*time.Millisecond, nil)).SetName("EGRESS_PRODUCERS_FLUSH")
+		sh.AddShutdownGroup(
+			handler("email", 2020*time.Millisecond, nil),
+			handler("sms", 40*time.Millisecond, errSMS),
+		).SetName("NOTIFICATIONS")
 		sh.AddShutdownGroup(
 			handler("payments", 1300*time.Millisecond, nil),
 			handler("refunds", 300*time.Millisecond, nil),
 		).SetName("PAYMENT_PROCESSING")
 		sh.AddShutdownGroup(
-			handler("email", 2020*time.Millisecond, nil),
-			handler("sms", 40*time.Millisecond, errSMS),
-		).SetName("NOTIFICATIONS")
-		sh.AddShutdownGroup(handler("kafka", 80*time.Millisecond, nil)).SetName("EGRESS_PRODUCERS_FLUSH")
-		sh.AddShutdownGroup(
-			handler("postgres", 12*time.Millisecond, nil),
-			handler("dynamo", 15*time.Millisecond, nil),
-		).SetName("DB_POOLS")
-		sh.AddShutdownGroup(handler("linkerd", 1100*time.Millisecond, nil)).SetName("SERVICE_MESH")
+			handler("orders consumer", 1104*time.Millisecond, nil),
+			handler("refunds consumer", 870*time.Millisecond, nil),
+		).SetName("INGRESS_CONSUMERS")
+		sh.AddShutdownGroup().SetName("INGRESS_HTTP").Go(func(ctx context.Context) error {
+			<-ctx.Done()
+			time.Sleep(312 * time.Millisecond)
+			return ctx.Err()
+		})
 		*stopped = stopWhenIdle(sh, sigterm)
 		return nil
 	}
 }
 
-// The lines the example service logs up to the shutdown's third group. Each handler logs as it
+// The lines the example service logs up to the third group to stop. Each handler logs as it
 // returns, so refunds consumer, added second, logs first.
 var exampleOpening = []string{
 	"started orders",
 	"stopping: terminated signal received",
 	"pausing for 5s before shutdown",
-	"shutdown group 1 (INGRESS_HTTP) with " + goName,
-	"shutdown group 1 (INGRESS_HTTP): " + goName + " done in 312ms",
-	"shutdown group 2 (INGRESS_CONSUMERS) with orders consumer, refunds consumer",
-	"shutdown group 2 (INGRESS_CONSUMERS): refunds consumer done in 870ms",
-	"shutdown group 2 (INGRESS_CONSUMERS): orders consumer done in 1.104s",
-	"shutdown group 3 (PAYMENT_PROCESSING) with payments, refunds",
+	"shutdown group 7 (INGRESS_HTTP) with " + goName,
+	"shutdown group 7 (INGRESS_HTTP): " + goName + " done in 312ms",
+	"shutdown group 6 (INGRESS_CONSUMERS) with orders consumer, refunds consumer",
+	"shutdown group 6 (INGRESS_CONSUMERS): refunds consumer done in 870ms",
+	"shutdown group 6 (INGRESS_CONSUMERS): orders consumer done in 1.104s",
+	"shutdown group 5 (PAYMENT_PROCESSING) with payments, refunds",
 }
 
 // The example service logs exactly these lines, each group beginning as the one before it ends:
@@ -141,18 +143,18 @@ func TestLinesMatchTheExample(t *testing.T) {
 
 		stopAt := <-stopped
 		assertLines(t, result.lines, append(slices.Clone(exampleOpening),
-			"shutdown group 3 (PAYMENT_PROCESSING): refunds done in 300ms",
-			"shutdown group 3 (PAYMENT_PROCESSING): payments done in 1.3s",
+			"shutdown group 5 (PAYMENT_PROCESSING): refunds done in 300ms",
+			"shutdown group 5 (PAYMENT_PROCESSING): payments done in 1.3s",
 			"shutdown group 4 (NOTIFICATIONS) with email, sms",
 			errorLine("shutdown group 4 (NOTIFICATIONS): sms failed after 40ms", "gateway unavailable"),
 			"shutdown group 4 (NOTIFICATIONS): email done in 2.02s",
-			"shutdown group 5 (EGRESS_PRODUCERS_FLUSH) with kafka",
-			"shutdown group 5 (EGRESS_PRODUCERS_FLUSH): kafka done in 80ms",
-			"shutdown group 6 (DB_POOLS) with postgres, dynamo",
-			"shutdown group 6 (DB_POOLS): postgres done in 12ms",
-			"shutdown group 6 (DB_POOLS): dynamo done in 15ms",
-			"shutdown group 7 (SERVICE_MESH) with linkerd",
-			"shutdown group 7 (SERVICE_MESH): linkerd done in 1.1s",
+			"shutdown group 3 (EGRESS_PRODUCERS_FLUSH) with kafka",
+			"shutdown group 3 (EGRESS_PRODUCERS_FLUSH): kafka done in 80ms",
+			"shutdown group 2 (DB_POOLS) with postgres, dynamo",
+			"shutdown group 2 (DB_POOLS): postgres done in 12ms",
+			"shutdown group 2 (DB_POOLS): dynamo done in 15ms",
+			"shutdown group 1 (SERVICE_MESH) with linkerd",
+			"shutdown group 1 (SERVICE_MESH): linkerd done in 1.1s",
 			cancellingWireCtx,
 			errorLine("stopped with an error", "group 4 (NOTIFICATIONS) sms: gateway unavailable"),
 			"exiting orders",
@@ -162,13 +164,13 @@ func TestLinesMatchTheExample(t *testing.T) {
 			msg string
 			at  time.Duration
 		}{
-			{"shutdown group 1 (INGRESS_HTTP) with " + goName, 5 * time.Second},
-			{"shutdown group 2 (INGRESS_CONSUMERS) with orders consumer, refunds consumer", 5312 * time.Millisecond},
-			{"shutdown group 3 (PAYMENT_PROCESSING) with payments, refunds", 6416 * time.Millisecond},
+			{"shutdown group 7 (INGRESS_HTTP) with " + goName, 5 * time.Second},
+			{"shutdown group 6 (INGRESS_CONSUMERS) with orders consumer, refunds consumer", 5312 * time.Millisecond},
+			{"shutdown group 5 (PAYMENT_PROCESSING) with payments, refunds", 6416 * time.Millisecond},
 			{"shutdown group 4 (NOTIFICATIONS) with email, sms", 7716 * time.Millisecond},
-			{"shutdown group 5 (EGRESS_PRODUCERS_FLUSH) with kafka", 9736 * time.Millisecond},
-			{"shutdown group 6 (DB_POOLS) with postgres, dynamo", 9816 * time.Millisecond},
-			{"shutdown group 7 (SERVICE_MESH) with linkerd", 9831 * time.Millisecond},
+			{"shutdown group 3 (EGRESS_PRODUCERS_FLUSH) with kafka", 9736 * time.Millisecond},
+			{"shutdown group 2 (DB_POOLS) with postgres, dynamo", 9816 * time.Millisecond},
+			{"shutdown group 1 (SERVICE_MESH) with linkerd", 9831 * time.Millisecond},
 		}
 		for _, begin := range begins {
 			if at := loggedAt(t, result.lines, begin.msg, stopAt); at != begin.at {
@@ -185,7 +187,8 @@ func TestLinesMatchTheExample(t *testing.T) {
 }
 
 // With payments hanging in PAYMENT_PROCESSING, refunds beside it still logs as it returns, payments
-// logs nothing before the deadline, and no later group begins: the deadline error names payments
+// logs nothing before the deadline, and no group due to stop after it begins: the deadline error
+// names payments
 func TestHangLogsNoLineBeforeTheDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
@@ -195,9 +198,9 @@ func TestHangLogsNoLineBeforeTheDeadline(t *testing.T) {
 		var stopped <-chan time.Time
 		result := bubbled(t, wireTheExample(map[string]shutdown.HandlerFunc{"payments": ignoring(release)}, &stopped))
 
-		const deadlineErr = "shutdown deadline 28s passed: group 3 (PAYMENT_PROCESSING) payments"
+		const deadlineErr = "shutdown deadline 28s passed: group 5 (PAYMENT_PROCESSING) payments"
 		assertLines(t, result.lines, append(slices.Clone(exampleOpening),
-			"shutdown group 3 (PAYMENT_PROCESSING): refunds done in 300ms",
+			"shutdown group 5 (PAYMENT_PROCESSING): refunds done in 300ms",
 			cancellingWireCtx,
 			errorLine("stopped with an error", deadlineErr),
 			"exiting orders",
@@ -246,8 +249,8 @@ func TestHangBesideAFailure(t *testing.T) {
 				}, &stopped))
 
 				assertLines(t, result.lines, append(slices.Clone(exampleOpening),
-					"shutdown group 3 (PAYMENT_PROCESSING): refunds done in 300ms",
-					"shutdown group 3 (PAYMENT_PROCESSING): payments done in 1.3s",
+					"shutdown group 5 (PAYMENT_PROCESSING): refunds done in 300ms",
+					"shutdown group 5 (PAYMENT_PROCESSING): payments done in 1.3s",
 					"shutdown group 4 (NOTIFICATIONS) with email, sms",
 					tc.smsLine,
 					cancellingWireCtx,
@@ -266,11 +269,11 @@ func TestHangBesideAFailure(t *testing.T) {
 func TestDeadlineBeforeAnyGroupLogsNoGroup(t *testing.T) {
 	const deadlineErr = "shutdown deadline 28s passed before group 2 (CORE) ledger"
 	addHandlers := func(sh bubbleShell, called *calls) {
-		sh.AddShutdownGroup().SetName("INGRESS")
+		called.add(sh.AddShutdownGroup().SetName("EGRESS"), "pool", quick)
 		core := sh.AddShutdownGroup().SetName("CORE")
 		called.add(core, "ledger", quick)
 		called.add(core, "outbox", quick)
-		called.add(sh.AddShutdownGroup().SetName("EGRESS"), "pool", quick)
+		sh.AddShutdownGroup().SetName("INGRESS")
 	}
 
 	t.Run("a wire returning after the deadline", func(t *testing.T) {
@@ -338,12 +341,12 @@ func TestEmptyGroupLogsNoHandlers(t *testing.T) {
 			want: []string{
 				"started orders",
 				"stopping: Stop called",
-				"shutdown group 1 (INGRESS_HTTP) with http",
-				"shutdown group 1 (INGRESS_HTTP): http done in 0s",
-				"shutdown group 2 (NOTIFICATIONS) with no handlers",
-				"shutdown group 3 (LEDGER) with no handlers",
-				"shutdown group 4 (DB_POOLS) with postgres",
-				"shutdown group 4 (DB_POOLS): postgres done in 0s",
+				"shutdown group 4 (INGRESS_HTTP) with http",
+				"shutdown group 4 (INGRESS_HTTP): http done in 0s",
+				"shutdown group 3 (NOTIFICATIONS) with no handlers",
+				"shutdown group 2 (LEDGER) with no handlers",
+				"shutdown group 1 (DB_POOLS) with postgres",
+				"shutdown group 1 (DB_POOLS): postgres done in 0s",
 				cancellingWireCtx,
 				"exiting orders",
 			},
@@ -355,9 +358,9 @@ func TestEmptyGroupLogsNoHandlers(t *testing.T) {
 			want: []string{
 				"started orders",
 				"stopping: Stop called",
-				"shutdown group 1 (INGRESS_HTTP) with http",
+				"shutdown group 4 (INGRESS_HTTP) with http",
 				cancellingWireCtx,
-				errorLine("stopped with an error", "shutdown deadline 28s passed: group 1 (INGRESS_HTTP) http"),
+				errorLine("stopped with an error", "shutdown deadline 28s passed: group 4 (INGRESS_HTTP) http"),
 				"exiting orders",
 			},
 		},
@@ -368,28 +371,28 @@ func TestEmptyGroupLogsNoHandlers(t *testing.T) {
 			want: []string{
 				"started orders",
 				"stopping: Stop called",
-				"shutdown group 1 (INGRESS_HTTP) with http",
-				"shutdown group 1 (INGRESS_HTTP): http done in 0s",
-				"shutdown group 2 (NOTIFICATIONS) with no handlers",
-				"shutdown group 3 (LEDGER) with no handlers",
-				"shutdown group 4 (DB_POOLS) with postgres",
+				"shutdown group 4 (INGRESS_HTTP) with http",
+				"shutdown group 4 (INGRESS_HTTP): http done in 0s",
+				"shutdown group 3 (NOTIFICATIONS) with no handlers",
+				"shutdown group 2 (LEDGER) with no handlers",
+				"shutdown group 1 (DB_POOLS) with postgres",
 				cancellingWireCtx,
-				errorLine("stopped with an error", "shutdown deadline 28s passed: group 4 (DB_POOLS) postgres"),
+				errorLine("stopped with an error", "shutdown deadline 28s passed: group 1 (DB_POOLS) postgres"),
 				"exiting orders",
 			},
 		},
 		{
 			name:   "an empty group's begin line held to the deadline",
-			slowOn: "shutdown group 2 (NOTIFICATIONS) with",
+			slowOn: "shutdown group 3 (NOTIFICATIONS) with",
 			code:   1,
 			want: []string{
 				"started orders",
 				"stopping: Stop called",
-				"shutdown group 1 (INGRESS_HTTP) with http",
-				"shutdown group 1 (INGRESS_HTTP): http done in 0s",
-				"shutdown group 2 (NOTIFICATIONS) with no handlers",
+				"shutdown group 4 (INGRESS_HTTP) with http",
+				"shutdown group 4 (INGRESS_HTTP): http done in 0s",
+				"shutdown group 3 (NOTIFICATIONS) with no handlers",
 				cancellingWireCtx,
-				errorLine("stopped with an error", "shutdown deadline 28s passed before group 4 (DB_POOLS) postgres"),
+				errorLine("stopped with an error", "shutdown deadline 28s passed before group 1 (DB_POOLS) postgres"),
 				"exiting orders",
 			},
 		},
@@ -413,10 +416,10 @@ func TestEmptyGroupLogsNoHandlers(t *testing.T) {
 					return quick
 				}
 				result := bubbledWith(t, logger, func(_ context.Context, sh bubbleShell) error {
-					sh.AddShutdownGroup(shutdown.Named("http", handler(tc.http))).SetName("INGRESS_HTTP")
-					sh.AddShutdownGroup().SetName("NOTIFICATIONS")
-					sh.AddShutdownGroup().SetName("LEDGER")
 					sh.AddShutdownGroup(shutdown.Named("postgres", handler(tc.postgres))).SetName("DB_POOLS")
+					sh.AddShutdownGroup().SetName("LEDGER")
+					sh.AddShutdownGroup().SetName("NOTIFICATIONS")
+					sh.AddShutdownGroup(shutdown.Named("http", handler(tc.http))).SetName("INGRESS_HTTP")
 					stopWhenIdle(sh, nil)
 					return nil
 				})
@@ -440,38 +443,38 @@ func TestDurationsRoundToTheMillisecond(t *testing.T) {
 
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
+			sh.AddShutdownGroup(shutdown.Named("pool", ignoring(release))).SetName("EGRESS")
+			sh.AddShutdownGroup(
+				shutdown.Named("outbox", sleepsThen(1000500*time.Microsecond, errors.New("outbox broke"))),
+				shutdown.Named("ledger", sleepsThen(200*time.Microsecond, nil)),
+			).SetName("CORE")
 			sh.AddShutdownGroup(
 				shutdown.Named("slow", sleepsThen(312600*time.Microsecond, nil)),
 				shutdown.Named("half", sleepsThen(500*time.Microsecond, nil)),
 				shutdown.Named("fast", sleepsThen(400*time.Microsecond, nil)),
 			).SetName("INGRESS")
-			sh.AddShutdownGroup(
-				shutdown.Named("outbox", sleepsThen(1000500*time.Microsecond, errors.New("outbox broke"))),
-				shutdown.Named("ledger", sleepsThen(200*time.Microsecond, nil)),
-			).SetName("CORE")
-			sh.AddShutdownGroup(shutdown.Named("pool", ignoring(release))).SetName("EGRESS")
 			stopped = stopWhenIdle(sh, nil)
 			return nil
 		})
 
 		// CORE takes 1.0005s from 312.6ms, so EGRESS begins at 1.3131s
-		const deadlineErr = "shutdown deadline 28s passed: group 3 (EGRESS) pool"
+		const deadlineErr = "shutdown deadline 28s passed: group 1 (EGRESS) pool"
 		assertLines(t, result.lines,
 			"started orders",
 			"stopping: Stop called",
-			"shutdown group 1 (INGRESS) with slow, half, fast",
-			"shutdown group 1 (INGRESS): fast done in 0s",
-			"shutdown group 1 (INGRESS): half done in 1ms",
-			"shutdown group 1 (INGRESS): slow done in 313ms",
+			"shutdown group 3 (INGRESS) with slow, half, fast",
+			"shutdown group 3 (INGRESS): fast done in 0s",
+			"shutdown group 3 (INGRESS): half done in 1ms",
+			"shutdown group 3 (INGRESS): slow done in 313ms",
 			"shutdown group 2 (CORE) with outbox, ledger",
 			"shutdown group 2 (CORE): ledger done in 0s",
 			errorLine("shutdown group 2 (CORE): outbox failed after 1.001s", "outbox broke"),
-			"shutdown group 3 (EGRESS) with pool",
+			"shutdown group 1 (EGRESS) with pool",
 			cancellingWireCtx,
 			errorLine("stopped with an error", "group 2 (CORE) outbox: outbox broke\n"+deadlineErr),
 			"exiting orders",
 		)
-		if at := loggedAt(t, result.lines, "shutdown group 3 (EGRESS) with pool", <-stopped); at != 1313100*time.Microsecond {
+		if at := loggedAt(t, result.lines, "shutdown group 1 (EGRESS) with pool", <-stopped); at != 1313100*time.Microsecond {
 			t.Errorf("EGRESS began %s after the stop, want 1.3131s, unrounded", at)
 		}
 	})
@@ -568,7 +571,7 @@ func TestNoHandlersLogsNothingRegistered(t *testing.T) {
 		want   []string
 	}{
 		{"no groups", 0, nil},
-		{"two empty groups", 2, []string{"shutdown group 1 with no handlers", "shutdown group 2 with no handlers"}},
+		{"two empty groups", 2, []string{"shutdown group 2 with no handlers", "shutdown group 1 with no handlers"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -597,18 +600,18 @@ func TestNoHandlersLogsNothingRegistered(t *testing.T) {
 // not logged
 func TestShutdownRunsAfterAFailingWire(t *testing.T) {
 	addBoth := func(sh bubbleShell) {
-		sh.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(quick))).SetName("INGRESS")
 		sh.AddShutdownGroup(
 			shutdown.Named("outbox", shutdown.HandlerFunc(quick)),
 			shutdown.Named("ledger", sleepsThen(time.Millisecond, nil)),
 		).SetName("CORE")
+		sh.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(quick))).SetName("INGRESS")
 	}
 	ran := []string{
-		"shutdown group 1 (INGRESS) with consumer",
-		"shutdown group 1 (INGRESS): consumer done in 0s",
-		"shutdown group 2 (CORE) with outbox, ledger",
-		"shutdown group 2 (CORE): outbox done in 0s",
-		"shutdown group 2 (CORE): ledger done in 1ms",
+		"shutdown group 2 (INGRESS) with consumer",
+		"shutdown group 2 (INGRESS): consumer done in 0s",
+		"shutdown group 1 (CORE) with outbox, ledger",
+		"shutdown group 1 (CORE): outbox done in 0s",
+		"shutdown group 1 (CORE): ledger done in 1ms",
 	}
 	cases := []struct {
 		name   string
@@ -660,27 +663,28 @@ func TestShutdownRunsAfterAFailingWire(t *testing.T) {
 	}
 }
 
-// The begin line is logged only before the deadline: a logger holding the first group's begin line
-// past it leaves that group's handlers never called and the next group with no line of its own
+// The begin line is logged only before the deadline: a logger holding the begin line of the first
+// group to stop past it leaves that group's handlers never called and the group due to stop next
+// with no line of its own
 func TestNoBeginLineAfterTheDeadline(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		logger := &lifecycle{slow: func(msg string) {
-			if msg == "shutdown group 1 (INGRESS) with consumer" {
+			if msg == "shutdown group 2 (INGRESS) with consumer" {
 				time.Sleep(28 * time.Second)
 			}
 		}}
 		result := bubbledWith(t, logger, func(_ context.Context, sh bubbleShell) error {
-			sh.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(quick))).SetName("INGRESS")
 			sh.AddShutdownGroup(shutdown.Named("ledger", shutdown.HandlerFunc(quick))).SetName("CORE")
+			sh.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(quick))).SetName("INGRESS")
 			stopWhenIdle(sh, nil)
 			return nil
 		})
 
-		const deadlineErr = "shutdown deadline 28s passed before group 1 (INGRESS) consumer"
+		const deadlineErr = "shutdown deadline 28s passed before group 2 (INGRESS) consumer"
 		assertLines(t, result.lines,
 			"started orders",
 			"stopping: Stop called",
-			"shutdown group 1 (INGRESS) with consumer",
+			"shutdown group 2 (INGRESS) with consumer",
 			cancellingWireCtx,
 			errorLine("stopped with an error", deadlineErr),
 			"exiting orders",

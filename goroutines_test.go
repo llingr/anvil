@@ -104,26 +104,26 @@ func TestGoNilReturnOnceStoppingIsQuiet(t *testing.T) {
 	}
 }
 
-// The goroutine's group waits for it to return, so the group after it starts only once it has, and
-// a goroutine returning its ctx's error once told to stop is a clean end
+// The goroutine's group waits for it to return, so the group stopping after it, added before it,
+// starts only once it has, and a goroutine returning its ctx's error once told to stop is a clean end
 func TestGoGroupWaitsForTheGoroutine(t *testing.T) {
 	var finished, finishedBeforeNext atomic.Bool
 	code := anvil.Run(context.Background(), "test", quietConfig{}, quietLogger{}, func(ctx context.Context, shell quietShell) error {
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
+			finishedBeforeNext.Store(finished.Load())
+			return nil
+		}))
 		shell.AddShutdownGroup().Go(func(ctx context.Context) error {
 			<-ctx.Done()
 			time.Sleep(100 * time.Millisecond) // finishing the message in hand
 			finished.Store(true)
 			return ctx.Err()
 		})
-		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
-			finishedBeforeNext.Store(finished.Load())
-			return nil
-		}))
 		shell.Stop(nil)
 		return nil
 	}, anvil.WithDrainDelay(0))
 	if code != 0 || !finishedBeforeNext.Load() {
-		t.Fatalf("exit %d, consumer finished before the next group %v, want 0 and true", code, finishedBeforeNext.Load())
+		t.Fatalf("exit %d, consumer finished before the group stopping after it %v, want 0 and true", code, finishedBeforeNext.Load())
 	}
 }
 
@@ -135,22 +135,22 @@ func TestGoOverrunIsReported(t *testing.T) {
 	defer close(release)
 	logger := newRecordingLogger()
 	code := anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
+		shell.AddShutdownGroup()
 		shell.AddShutdownGroup().SetName("INGRESS").Go(func(context.Context) error {
 			<-release
 			return nil
 		})
-		shell.AddShutdownGroup()
 		shell.Stop(nil)
 		return nil
 	}, shutdownWithin(300*time.Millisecond)...)
-	const stopped = "stopped with an error: shutdown deadline 300ms passed: group 1 (INGRESS) " + goName
+	const stopped = "stopped with an error: shutdown deadline 300ms passed: group 2 (INGRESS) " + goName
 	lines := logger.errorLines()
 	if code != 1 || !slices.Contains(lines, stopped) {
 		t.Fatalf("exit %d, errors %q, want 1 and the overrun reported", code, lines)
 	}
 	// the late line's time is measured in real time here; the synctest tests pin it exactly
 	for _, line := range lines {
-		late := strings.HasPrefix(line, "shutdown group 1 (INGRESS): "+goName+" errored ") &&
+		late := strings.HasPrefix(line, "shutdown group 2 (INGRESS): "+goName+" errored ") &&
 			strings.HasSuffix(line, " after the deadline: context deadline exceeded")
 		if line != stopped && !late {
 			t.Errorf("error line %q, want only the overrun and the go record's late line", line)
@@ -207,16 +207,16 @@ func TestGoNilFuncRefusedOnceWireReturns(t *testing.T) {
 func TestGoErrorBeforeItsGroupBeginsIsReported(t *testing.T) {
 	logger := newRecordingLogger()
 	code := anvil.Run(context.Background(), "test", noConfig{}, logger, func(ctx context.Context, shell recordedShell) error {
-		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error {
-			time.Sleep(100 * time.Millisecond)
-			return nil
-		}))
 		shell.AddShutdownGroup().SetName("INGRESS").Go(func(context.Context) error {
 			for !shell.Stopping() {
 				time.Sleep(time.Millisecond)
 			}
 			return errors.New("commit failed")
 		})
+		shell.AddShutdownGroup(shutdown.HandlerFunc(func(context.Context) error { // stops first, holding INGRESS back
+			time.Sleep(100 * time.Millisecond)
+			return nil
+		}))
 		shell.Stop(nil)
 		return nil
 	}, anvil.WithDrainDelay(0))
@@ -224,9 +224,9 @@ func TestGoErrorBeforeItsGroupBeginsIsReported(t *testing.T) {
 	// from 0s to 1ms
 	lines := logger.errorLines()
 	if code != 1 || len(lines) != 2 ||
-		!strings.HasPrefix(lines[0], "shutdown group 2 (INGRESS): "+goName+" failed after ") ||
+		!strings.HasPrefix(lines[0], "shutdown group 1 (INGRESS): "+goName+" failed after ") ||
 		!strings.HasSuffix(lines[0], ": commit failed") ||
-		lines[1] != "stopped with an error: group 2 (INGRESS) "+goName+": commit failed" {
+		lines[1] != "stopped with an error: group 1 (INGRESS) "+goName+": commit failed" {
 		t.Fatalf("exit %d, errors %q, want 1, the go function's failed line and the final error", code, lines)
 	}
 }

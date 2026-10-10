@@ -110,29 +110,61 @@ func TestHandlerNamesInTheLines(t *testing.T) {
 	})
 }
 
-// A group is labelled by its position among the groups, from 1, with the name SetName gave it in
-// brackets, in every line and error; SetName may come after handlers are added
+// A group is labelled by its position in the order the groups were added, from 1, not by when it
+// stops, with the name SetName gave it in brackets, in every line and error; SetName may come after
+// handlers are added
 func TestGroupsAreLabelledByPosition(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-			sh.AddShutdownGroup(shutdown.Named("http", shutdown.HandlerFunc(quick)))
-			sh.AddShutdownGroup(shutdown.Named("payments", sleepsThen(time.Second, errors.New("refund lost")))).SetName("PAYMENTS")
 			sh.AddShutdownGroup(shutdown.Named("postgres", shutdown.HandlerFunc(quick)))
+			sh.AddShutdownGroup(shutdown.Named("payments", sleepsThen(time.Second, errors.New("refund lost")))).SetName("PAYMENTS")
+			sh.AddShutdownGroup(shutdown.Named("http", shutdown.HandlerFunc(quick)))
 			stopWhenIdle(sh, nil)
 			return nil
 		})
 
-		assertLines(t, from(result.lines, "shutdown group 1 with"),
-			"shutdown group 1 with http",
-			"shutdown group 1: http done in 0s",
+		assertLines(t, from(result.lines, "shutdown group 3 with"),
+			"shutdown group 3 with http",
+			"shutdown group 3: http done in 0s",
 			"shutdown group 2 (PAYMENTS) with payments",
 			errorLine("shutdown group 2 (PAYMENTS): payments failed after 1s", "refund lost"),
-			"shutdown group 3 with postgres",
-			"shutdown group 3: postgres done in 0s",
+			"shutdown group 1 with postgres",
+			"shutdown group 1: postgres done in 0s",
 			cancellingWireCtx,
 			errorLine("stopped with an error", "group 2 (PAYMENTS) payments: refund lost"),
 			"exiting orders",
 		)
+	})
+}
+
+// Groups stop in reverse of the order they were added, as deferred calls run, so a service that adds
+// each group as it opens what the group stops (a pool, then a worker using the pool, then a server
+// feeding the worker) stops the server first and the pool last
+func TestGroupsStopInReverseOfTheOrderAdded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
+			sh.AddShutdownGroup(shutdown.Named("postgres", shutdown.HandlerFunc(quick))).SetName("POOL")
+			sh.AddShutdownGroup(shutdown.Named("consumer", shutdown.HandlerFunc(quick))).SetName("WORKER")
+			sh.AddShutdownGroup(shutdown.Named("http", shutdown.HandlerFunc(quick))).SetName("SERVER")
+			stopWhenIdle(sh, nil)
+			return nil
+		})
+
+		assertLines(t, result.lines,
+			"started orders",
+			"stopping: Stop called",
+			"shutdown group 3 (SERVER) with http",
+			"shutdown group 3 (SERVER): http done in 0s",
+			"shutdown group 2 (WORKER) with consumer",
+			"shutdown group 2 (WORKER): consumer done in 0s",
+			"shutdown group 1 (POOL) with postgres",
+			"shutdown group 1 (POOL): postgres done in 0s",
+			cancellingWireCtx,
+			"exiting orders",
+		)
+		if result.code != 0 {
+			t.Errorf("exit code %d, want 0: %v", result.code, result.failure())
+		}
 	})
 }
 
@@ -141,24 +173,24 @@ func TestGroupsAreLabelledByPosition(t *testing.T) {
 func TestNamesAreNotChecked(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
+			sh.AddShutdownGroup().SetName("")
 			sh.AddShutdownGroup(
 				shutdown.Named("a->b; [x], y", sleepsThen(time.Millisecond, nil)),
 				shutdown.Named("", sleepsThen(2*time.Millisecond, nil)),
 				shutdown.Named("twice", sleepsThen(3*time.Millisecond, nil)),
 				shutdown.Named("twice", sleepsThen(4*time.Millisecond, nil)),
 			).SetName("DB POOLS: (x)")
-			sh.AddShutdownGroup().SetName("")
 			stopWhenIdle(sh, nil)
 			return nil
 		})
 
-		assertLines(t, from(result.lines, "shutdown group 1"),
-			"shutdown group 1 (DB POOLS: (x)) with a->b; [x], y, , twice, twice",
-			"shutdown group 1 (DB POOLS: (x)): a->b; [x], y done in 1ms",
-			"shutdown group 1 (DB POOLS: (x)):  done in 2ms",
-			"shutdown group 1 (DB POOLS: (x)): twice done in 3ms",
-			"shutdown group 1 (DB POOLS: (x)): twice done in 4ms",
-			"shutdown group 2 with no handlers",
+		assertLines(t, from(result.lines, "shutdown group 2"),
+			"shutdown group 2 (DB POOLS: (x)) with a->b; [x], y, , twice, twice",
+			"shutdown group 2 (DB POOLS: (x)): a->b; [x], y done in 1ms",
+			"shutdown group 2 (DB POOLS: (x)):  done in 2ms",
+			"shutdown group 2 (DB POOLS: (x)): twice done in 3ms",
+			"shutdown group 2 (DB POOLS: (x)): twice done in 4ms",
+			"shutdown group 1 with no handlers",
 			cancellingWireCtx,
 			"exiting orders",
 		)

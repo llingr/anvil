@@ -100,7 +100,7 @@ func holds(_ context.Context, release <-chan struct{}) error {
 }
 
 // A Go function is told to stop as its group begins, together with the group's handlers, and the
-// group waits for it to return before the next group begins
+// group waits for it to return before the next group to stop begins
 func TestGoToldToStopAsItsGroupBegins(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
@@ -111,14 +111,10 @@ func TestGoToldToStopAsItsGroupBegins(t *testing.T) {
 		told := newStops()
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-			// INGRESS for 3s, held by listener
-			ingress := sh.AddShutdownGroup().SetName("INGRESS")
-			called.add(ingress, "listener", func(context.Context) error {
-				time.Sleep(3 * time.Second)
-				return nil
-			})
-			told.add(ingress, "consumer", returnsAfter(0), release)
-			told.add(ingress, "poller", returnsAfter(2*time.Second), release)
+			// EGRESS, added first so it stops last
+			egress := sh.AddShutdownGroup().SetName("EGRESS")
+			told.add(egress, "publisher", returnsAfter(0), release)
+			called.add(egress, "pool", quick)
 			// CORE for 4s, held by relay once told
 			core := sh.AddShutdownGroup().SetName("CORE")
 			called.add(core, "outbox", func(context.Context) error {
@@ -126,10 +122,14 @@ func TestGoToldToStopAsItsGroupBegins(t *testing.T) {
 				return nil
 			})
 			told.add(core, "relay", returnsAfter(4*time.Second), release)
-			// EGRESS
-			egress := sh.AddShutdownGroup().SetName("EGRESS")
-			told.add(egress, "publisher", returnsAfter(0), release)
-			called.add(egress, "pool", quick)
+			// INGRESS for 3s, held by listener, added last so it stops first
+			ingress := sh.AddShutdownGroup().SetName("INGRESS")
+			called.add(ingress, "listener", func(context.Context) error {
+				time.Sleep(3 * time.Second)
+				return nil
+			})
+			told.add(ingress, "consumer", returnsAfter(0), release)
+			told.add(ingress, "poller", returnsAfter(2*time.Second), release)
 			stopped = stopWhenIdle(sh, nil)
 			return nil
 		})
@@ -191,8 +191,8 @@ func TestGoNotToldToStopDuringTheDrain(t *testing.T) {
 				told := newStops()
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-					told.add(sh.AddShutdownGroup().SetName("INGRESS"), "http", returnsAfter(0), release)
 					told.add(sh.AddShutdownGroup().SetName("EGRESS"), "publisher", returnsAfter(0), release)
+					told.add(sh.AddShutdownGroup().SetName("INGRESS"), "http", returnsAfter(0), release)
 					stopped = stopWhenIdle(sh, stopping.reason)
 					return nil
 				}, stopping.opts...)
@@ -237,12 +237,12 @@ func TestUnreachedGoFunctionsToldToStopAtTheEnd(t *testing.T) {
 				told := newStops()
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-					told.add(sh.AddShutdownGroup().SetName("INGRESS"), "consumer", returnsAfter(0), release)
-					called.add(sh.AddShutdownGroup().SetName("CORE"), "outbox", ignoring(release))
-					told.add(sh.AddShutdownGroup().SetName("RELAY"), "relay", holds, release)
 					egress := sh.AddShutdownGroup().SetName("EGRESS")
 					told.add(egress, "publisher", holds, release)
 					called.add(egress, "pool", quick)
+					told.add(sh.AddShutdownGroup().SetName("RELAY"), "relay", holds, release)
+					called.add(sh.AddShutdownGroup().SetName("CORE"), "outbox", ignoring(release))
+					told.add(sh.AddShutdownGroup().SetName("INGRESS"), "consumer", returnsAfter(0), release)
 					stopped = stopWhenIdle(sh, tc.reason)
 					return nil
 				}, tc.opts...)
@@ -290,9 +290,9 @@ func TestGoCauseCarriesTheDeadline(t *testing.T) {
 		told := newStops()
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-			told.add(sh.AddShutdownGroup().SetName("INGRESS"), "consumer", returnsAfter(0), release) // by its group
-			sh.AddShutdownGroup(shutdown.Named("outbox", ignoring(release))).SetName("CORE")
 			told.add(sh.AddShutdownGroup().SetName("EGRESS"), "publisher", returnsAfter(0), release) // by the shutdown's end
+			sh.AddShutdownGroup(shutdown.Named("outbox", ignoring(release))).SetName("CORE")
+			told.add(sh.AddShutdownGroup().SetName("INGRESS"), "consumer", returnsAfter(0), release) // by its group
 			stopped = stopWhenIdle(sh, sigterm)
 			return nil
 		}, WithShutdownGracePeriod(10*time.Second), WithDrainDelay(3*time.Second))
@@ -330,19 +330,20 @@ func TestGoCauseCarriesTheDeadline(t *testing.T) {
 }
 
 // A Go function that returns only when a separate handler shuts its server down works when both are
-// in one group, called together, but with the handler in a later group the Go function's group waits
-// for a return only the later handler can cause, so the shutdown waits for the deadline
-func TestGoServeWithItsShutdownInALaterGroupWaitsForTheDeadline(t *testing.T) {
+// in one group, called together, but with the handler in a group that stops later, one added
+// earlier, the Go function's group waits for a return only that handler can cause, so the shutdown
+// waits for the deadline
+func TestGoServeWithItsShutdownInAGroupStoppingLaterWaitsForTheDeadline(t *testing.T) {
 	cases := []struct {
 		name     string
-		apart    bool // whether the shutdown handler is in a group of its own, after the Go function's
+		apart    bool // whether the shutdown handler is in a group of its own, stopping after the Go function's
 		code     int
 		took     time.Duration
 		called   string // the shutdown handler as calls records it
 		shutdown bool   // whether the separate shutdown handler is called
 	}{
 		{"one group", false, 0, 0, "SERVER shutdown", true},
-		{"a later group", true, 1, 28 * time.Second, "LATER shutdown", false},
+		{"a group stopping later", true, 1, 28 * time.Second, "LATER shutdown", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -355,6 +356,10 @@ func TestGoServeWithItsShutdownInALaterGroupWaitsForTheDeadline(t *testing.T) {
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
 					serving := make(chan struct{}) // closed by server.Shutdown
+					var later ShutdownGroup
+					if tc.apart {
+						later = sh.AddShutdownGroup().SetName("LATER") // added first, so it stops after SERVER
+					}
 					group := sh.AddShutdownGroup().SetName("SERVER")
 					group.Go(func(context.Context) error {
 						select {
@@ -364,7 +369,7 @@ func TestGoServeWithItsShutdownInALaterGroupWaitsForTheDeadline(t *testing.T) {
 						return http.ErrServerClosed
 					})
 					if tc.apart {
-						group = sh.AddShutdownGroup().SetName("LATER")
+						group = later
 					}
 					called.add(group, "shutdown", func(context.Context) error {
 						close(serving)
@@ -496,7 +501,7 @@ type handlerSaw struct {
 // A server's shutdown handler and the Go function serving it, in one group, are called together as
 // the group begins: the handler with a live ctx carrying the shutdown deadline, and the function
 // told to stop at the same instant. The group waits for the function, whose http.ErrServerClosed
-// after the stop is clean, before the next group begins.
+// after the stop is clean, before the next group to stop begins.
 func TestGoAndItsServersShutdownAreCalledTogether(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		release := make(chan struct{})
@@ -509,6 +514,7 @@ func TestGoAndItsServersShutdownAreCalledTogether(t *testing.T) {
 		called := newCalls()
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
+			called.add(sh.AddShutdownGroup().SetName("EGRESS"), "pool", quick)
 			serving := make(chan struct{}) // closed by the handler, as server.Shutdown ends Serve
 			server := shutdown.Named("server", shutdown.HandlerFunc(func(ctx context.Context) error {
 				deadline, ok := ctx.Deadline()
@@ -527,7 +533,6 @@ func TestGoAndItsServersShutdownAreCalledTogether(t *testing.T) {
 				returnedAt = time.Now()
 				return http.ErrServerClosed
 			})
-			called.add(sh.AddShutdownGroup().SetName("EGRESS"), "pool", quick)
 			stopped = stopWhenIdle(sh, sigterm)
 			return nil
 		}, WithShutdownGracePeriod(10*time.Second), WithDrainDelay(3*time.Second))
@@ -581,12 +586,12 @@ func TestGoBesideItsServersShutdown(t *testing.T) {
 		reported string // the error stopped with an error carries, "" for none
 	}{
 		{name: "returns ErrServerClosed once stopped", group: "INGRESS"},
-		{name: "fails before any stop", group: "INGRESS", failsAt: time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 1 (INGRESS): listener closed"},
-		{name: "fails during the drain", reason: sigterm, group: "INGRESS", failsAt: 3 * time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 1 (INGRESS) " + goName + ": listener closed"},
-		{name: "cancelled during the drain", reason: sigterm, group: "INGRESS", failsAt: 3 * time.Second, failure: fmt.Errorf("accept: %w", context.Canceled), code: 1, reported: "group 1 (INGRESS) " + goName + ": accept: context canceled"},
-		{name: "fails while an earlier group runs", group: "EGRESS", failsAt: 3 * time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 2 (EGRESS) " + goName + ": listener closed"},
-		{name: "the server's shutdown fails", group: "INGRESS", stopErr: errors.New("shutdown failed"), code: 1, reported: "group 1 (INGRESS) server: shutdown failed"},
-		{name: "the server's shutdown does not end fn", group: "INGRESS", ignored: true, code: 1, reported: "shutdown deadline 28s passed: group 1 (INGRESS) " + goName},
+		{name: "fails before any stop", group: "INGRESS", failsAt: time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 2 (INGRESS): listener closed"},
+		{name: "fails during the drain", reason: sigterm, group: "INGRESS", failsAt: 3 * time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 2 (INGRESS) " + goName + ": listener closed"},
+		{name: "cancelled during the drain", reason: sigterm, group: "INGRESS", failsAt: 3 * time.Second, failure: fmt.Errorf("accept: %w", context.Canceled), code: 1, reported: "group 2 (INGRESS) " + goName + ": accept: context canceled"},
+		{name: "fails while a group stopping before it runs", group: "EGRESS", failsAt: 3 * time.Second, failure: errors.New("listener closed"), code: 1, reported: "group 1 (EGRESS) " + goName + ": listener closed"},
+		{name: "the server's shutdown fails", group: "INGRESS", stopErr: errors.New("shutdown failed"), code: 1, reported: "group 2 (INGRESS) server: shutdown failed"},
+		{name: "the server's shutdown does not end fn", group: "INGRESS", ignored: true, code: 1, reported: "shutdown deadline 28s passed: group 2 (INGRESS) " + goName},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -616,12 +621,12 @@ func TestGoBesideItsServersShutdown(t *testing.T) {
 						}
 					}
 					outbox := shutdown.Named("outbox", sleepsThen(2*time.Second, nil))
-					if tc.group == "INGRESS" {
+					if tc.group == "INGRESS" { // stops first, before CORE
+						sh.AddShutdownGroup(outbox).SetName("CORE")
 						sh.AddShutdownGroup(server).SetName("INGRESS").Go(serve)
-						sh.AddShutdownGroup(outbox).SetName("CORE")
-					} else {
-						sh.AddShutdownGroup(outbox).SetName("CORE")
+					} else { // stops after CORE
 						sh.AddShutdownGroup(server).SetName("EGRESS").Go(serve)
+						sh.AddShutdownGroup(outbox).SetName("CORE")
 					}
 					stopAfter(sh, 2*time.Second, tc.reason)
 					return nil
@@ -1121,8 +1126,8 @@ func TestStopContextForAnUnreachedFunction(t *testing.T) {
 				seen := make(chan stopSeen, 1)
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-					sh.AddShutdownGroup(shutdown.Named("outbox", ignoring(release)))
 					sh.AddShutdownGroup().Go(seesStopContext(seen, release))
+					sh.AddShutdownGroup(shutdown.Named("outbox", ignoring(release))) // stops first and never returns
 					if tc.lateWire == 0 {
 						stopped = stopWhenIdle(sh, tc.reason)
 						return nil

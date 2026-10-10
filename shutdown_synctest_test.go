@@ -309,15 +309,15 @@ var shutdownStops = []struct {
 // However badly the handlers of any group behave, the shutdown ends exactly at the deadline counted
 // from the stop, drain included, and Run returns 1 without waiting for the handlers left running
 func TestShutdownEndsAtTheDeadline(t *testing.T) {
-	everyGroup := []string{"INGRESS", "CORE", "EGRESS"}
+	everyGroup := []string{"INGRESS", "CORE", "EGRESS"} // in the order they stop, so added in reverse
 	unrulyGroups := []struct {
 		names []string
-		first string // the label of the first unruly group, as the log lines and errors show it
+		first string // the label of the first unruly group to stop, as the log lines and errors show it
 	}{
-		{[]string{"INGRESS"}, "group 1 (INGRESS)"},
+		{[]string{"INGRESS"}, "group 3 (INGRESS)"},
 		{[]string{"CORE"}, "group 2 (CORE)"},
-		{[]string{"EGRESS"}, "group 3 (EGRESS)"},
-		{everyGroup, "group 1 (INGRESS)"},
+		{[]string{"EGRESS"}, "group 1 (EGRESS)"},
+		{everyGroup, "group 3 (INGRESS)"},
 	}
 	for _, stop := range shutdownStops {
 		for _, unrulyGroup := range unrulyGroups {
@@ -333,7 +333,7 @@ func TestShutdownEndsAtTheDeadline(t *testing.T) {
 					told := newStops()
 					var stopped <-chan time.Time
 					result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-						for _, groupName := range everyGroup {
+						for _, groupName := range slices.Backward(everyGroup) {
 							group := sh.AddShutdownGroup().SetName(groupName)
 							if slices.Contains(misbehaving, groupName) {
 								unruly(group, called, told, release)
@@ -417,8 +417,9 @@ func TestShutdownEndsAtTheDeadline(t *testing.T) {
 	}
 }
 
-// Every handler called is called before the deadline, and a handler in a group behind one still
-// running at the deadline, or behind a wire that returned too late, is never called
+// Every handler called is called before the deadline, and a handler in a group due to stop after one
+// still running at the deadline, or behind a wire that returned too late, is never called. Each case
+// adds its groups in reverse of the order they stop.
 func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 	cases := []struct {
 		name   string
@@ -429,9 +430,9 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 		{
 			name: "a hang in INGRESS",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(ingress, "stuck", ignoring(release))
 				called.add(core, "ledger", quick)
@@ -440,14 +441,14 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopWhenIdle(sh, nil)
 			},
 			called: []string{"INGRESS consumer", "INGRESS stuck"},
-			failed: "shutdown deadline 28s passed: group 1 (INGRESS) stuck",
+			failed: "shutdown deadline 28s passed: group 3 (INGRESS) stuck",
 		},
 		{
 			name: "a hang alone in CORE",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(core, "stuck", ignoring(release))
 				called.add(egress, "producer", quick)
@@ -460,11 +461,11 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 		{
 			name: "a hang in a group between two others",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				outbox := sh.AddShutdownGroup().SetName("OUTBOX")
-				hang := sh.AddShutdownGroup().SetName("HANG")
-				ledger := sh.AddShutdownGroup().SetName("LEDGER")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				ledger := sh.AddShutdownGroup().SetName("LEDGER")
+				hang := sh.AddShutdownGroup().SetName("HANG")
+				outbox := sh.AddShutdownGroup().SetName("OUTBOX")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(outbox, "outbox", quick)
 				called.add(hang, "stuck", ignoring(release))
@@ -478,9 +479,9 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 		{
 			name: "a hang in EGRESS",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(core, "ledger", quick)
 				called.add(egress, "stuck", ignoring(release))
@@ -488,16 +489,16 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopWhenIdle(sh, nil)
 			},
 			called: []string{"INGRESS consumer", "CORE ledger", "EGRESS stuck", "EGRESS pool"},
-			failed: "shutdown deadline 28s passed: group 3 (EGRESS) stuck",
+			failed: "shutdown deadline 28s passed: group 1 (EGRESS) stuck",
 		},
 		{
 			name: "a Go function that ignores its ctx, in a group between two others",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				outbox := sh.AddShutdownGroup().SetName("OUTBOX")
-				relay := sh.AddShutdownGroup().SetName("RELAY")
-				ledger := sh.AddShutdownGroup().SetName("LEDGER")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				ledger := sh.AddShutdownGroup().SetName("LEDGER")
+				relay := sh.AddShutdownGroup().SetName("RELAY")
+				outbox := sh.AddShutdownGroup().SetName("OUTBOX")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(outbox, "outbox", quick)
 				called.goIgnoring(relay, release)
@@ -511,9 +512,9 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 		{
 			name: "a Go function in INGRESS that ignores its ctx, after a drain",
 			wire: func(sh bubbleShell, called *calls, release <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.goIgnoring(ingress, release)
 				called.add(ingress, "listener", quick)
 				called.add(core, "ledger", quick)
@@ -521,28 +522,28 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopWhenIdle(sh, sigterm)
 			},
 			called: []string{"INGRESS " + goName, "INGRESS listener"},
-			failed: "shutdown deadline 28s passed: group 1 (INGRESS) " + goName,
+			failed: "shutdown deadline 28s passed: group 3 (INGRESS) " + goName,
 		},
 		{
 			name: "a handler in INGRESS that returns as its ctx ends, after a drain",
 			wire: func(sh bubbleShell, called *calls, _ <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", patient)
 				called.add(core, "ledger", quick)
 				called.add(egress, "pool", quick)
 				return stopWhenIdle(sh, sigterm)
 			},
 			called: []string{"INGRESS consumer"},
-			failed: "shutdown deadline 28s passed: group 1 (INGRESS) consumer",
+			failed: "shutdown deadline 28s passed: group 3 (INGRESS) consumer",
 		},
 		{
 			name: "wire returns after the deadline",
 			wire: func(sh bubbleShell, called *calls, _ <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(core, "ledger", quick)
 				called.add(egress, "pool", quick)
@@ -551,14 +552,14 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopped
 			},
 			called: nil,
-			failed: "shutdown deadline 28s passed before group 1 (INGRESS) consumer",
+			failed: "shutdown deadline 28s passed before group 3 (INGRESS) consumer",
 		},
 		{
 			name: "wire returns at the deadline",
 			wire: func(sh bubbleShell, called *calls, _ <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", quick)
 				called.add(core, "ledger", quick)
 				called.add(egress, "pool", quick)
@@ -567,14 +568,14 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopped
 			},
 			called: nil,
-			failed: "shutdown deadline 28s passed before group 1 (INGRESS) consumer",
+			failed: "shutdown deadline 28s passed before group 3 (INGRESS) consumer",
 		},
 		{
 			name: "wire returns a second before the deadline",
 			wire: func(sh bubbleShell, called *calls, _ <-chan struct{}) <-chan time.Time {
-				ingress := sh.AddShutdownGroup().SetName("INGRESS")
-				core := sh.AddShutdownGroup().SetName("CORE")
 				egress := sh.AddShutdownGroup().SetName("EGRESS")
+				core := sh.AddShutdownGroup().SetName("CORE")
+				ingress := sh.AddShutdownGroup().SetName("INGRESS")
 				called.add(ingress, "consumer", patient)
 				called.add(ingress, "listener", quick)
 				called.add(core, "ledger", quick)
@@ -584,7 +585,7 @@ func TestNoHandlerCalledAfterTheDeadline(t *testing.T) {
 				return stopped
 			},
 			called: []string{"INGRESS consumer", "INGRESS listener"},
-			failed: "shutdown deadline 28s passed: group 1 (INGRESS) consumer",
+			failed: "shutdown deadline 28s passed: group 3 (INGRESS) consumer",
 		},
 	}
 	for _, tc := range cases {
@@ -672,12 +673,12 @@ func TestEveryHandlerHasTheShutdownDeadline(t *testing.T) {
 
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
+					sh.AddShutdownGroup(shutdown.Named("pool", observing("EGRESS pool", 0))).SetName("EGRESS")
+					sh.AddShutdownGroup(shutdown.Named("ledger", observing("CORE ledger", 2*time.Second))).SetName("CORE")
 					sh.AddShutdownGroup(
 						shutdown.Named("consumer", observing("INGRESS consumer", 0)),
 						shutdown.Named("listener", observing("INGRESS listener", 3*time.Second)),
 					).SetName("INGRESS")
-					sh.AddShutdownGroup(shutdown.Named("ledger", observing("CORE ledger", 2*time.Second))).SetName("CORE")
-					sh.AddShutdownGroup(shutdown.Named("pool", observing("EGRESS pool", 0))).SetName("EGRESS")
 					stopped = stopWhenIdle(sh, stop.reason)
 					return nil
 				}, stop.opts...)
@@ -792,14 +793,14 @@ func TestGroupCostsItsSlowestHandler(t *testing.T) {
 	}
 }
 
-// Groups of one handler each run one at a time, in the order added, so together they cost the sum
-// of their handlers
+// Groups of one handler each run one at a time, the last added first, so together they cost the
+// sum of their handlers
 func TestGroupsOfOneRunOneAtATime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		sequential := &occupancy{}
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-			for _, name := range []string{"orders", "ledger", "outbox"} {
+			for _, name := range []string{"outbox", "ledger", "orders"} {
 				sh.AddShutdownGroup(sequential.handler(name, 2*time.Second))
 			}
 			stopped = stopWhenIdle(sh, nil)
@@ -816,14 +817,15 @@ func TestGroupsOfOneRunOneAtATime(t *testing.T) {
 			t.Errorf("held %d handlers at once, want 1", most)
 		}
 		if order := sequential.order(); order != "orders ledger outbox" {
-			t.Errorf("handlers ran %q, want the order added", order)
+			t.Errorf("handlers ran %q, want the last added first", order)
 		}
 	})
 }
 
-// Groups run in the order AddShutdownGroup added them, whatever order their handlers were added
-// in, each starting as the one before it ends and costing its slowest handler
-func TestGroupsRunInTheOrderAdded(t *testing.T) {
+// Groups run in reverse of the order AddShutdownGroup added them, the last added first, whatever
+// order their handlers were added in, each starting as the one before it ends and costing its
+// slowest handler
+func TestGroupsRunLastAddedFirst(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		called := newCalls()
 		sleeping := func(delay time.Duration) shutdown.HandlerFunc {
@@ -834,10 +836,10 @@ func TestGroupsRunInTheOrderAdded(t *testing.T) {
 		}
 		var stopped <-chan time.Time
 		result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-			ingress := sh.AddShutdownGroup().SetName("INGRESS_HTTP")
-			payments := sh.AddShutdownGroup().SetName("PAYMENT_PROCESSING")
-			pools := sh.AddShutdownGroup().SetName("DB_POOLS")
 			ledger := sh.AddShutdownGroup().SetName("LEDGER")
+			pools := sh.AddShutdownGroup().SetName("DB_POOLS")
+			payments := sh.AddShutdownGroup().SetName("PAYMENT_PROCESSING")
+			ingress := sh.AddShutdownGroup().SetName("INGRESS_HTTP")
 			called.add(ledger, "outbox", sleeping(time.Second))
 			called.add(pools, "postgres", sleeping(2*time.Second))
 			called.add(payments, "payments", sleeping(2*time.Second))
@@ -930,7 +932,8 @@ func TestHandlersAndGoJoinTheirGroup(t *testing.T) {
 	})
 }
 
-// After a SIGTERM the pause is logged at once, and the first group begins exactly when it ends
+// After a SIGTERM the pause is logged at once, and the first group to stop begins exactly when it
+// ends
 func TestFirstGroupBeginsAsThePauseEnds(t *testing.T) {
 	cases := []struct {
 		name string
@@ -946,8 +949,8 @@ func TestFirstGroupBeginsAsThePauseEnds(t *testing.T) {
 				called := newCalls()
 				var stopped <-chan time.Time
 				result := bubbled(t, func(_ context.Context, sh bubbleShell) error {
-					called.add(sh.AddShutdownGroup().SetName("PAYMENTS"), "first", quick)
 					called.add(sh.AddShutdownGroup().SetName("POOLS"), "second", quick)
+					called.add(sh.AddShutdownGroup().SetName("PAYMENTS"), "first", quick)
 					stopped = stopWhenIdle(sh, sigterm)
 					return nil
 				}, tc.opts...)
