@@ -28,8 +28,9 @@ type Shell[C, L any] interface {
 	Logger() L
 
 	// AddShutdownGroup adds a group of handlers that stop
-	// together, after the groups already added. Must only
-	// be called during wiring.
+	// together, before the groups already added: the last
+	// group added stops first. Must only be called during
+	// wiring.
 	AddShutdownGroup(handlers ...shutdown.Handler) ShutdownGroup
 
 	// Stop invokes shutdown without waiting for OS signals.
@@ -69,7 +70,7 @@ type shell[C, L any] struct {
 	started        bool                    // indicates wiring has returned; finalizes registration
 	stoppedTime    time.Time               // first invoked time; stopping is idempotent
 	stopReason     error                   // nil for a clean Stop(nil)
-	groups         []*shutdownGroup        // in shutdown order
+	groups         []*shutdownGroup        // in the order added; they stop in reverse
 }
 
 // Run wraps a service or applications' whole lifecycle,

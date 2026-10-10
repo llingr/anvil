@@ -13,8 +13,8 @@ import (
 	"github.com/llingr/anvil/shutdown"
 )
 
-// ShutdownGroup is handlers that stop together. Groups stop one after another, in the order they
-// were added; each method may only be called during wiring.
+// ShutdownGroup is handlers that stop together. Groups stop one after another, the last added
+// first, as deferred calls run; each method may only be called during wiring.
 type ShutdownGroup interface {
 	// SetName names the group in the log lines, in place of its position
 	SetName(name string) ShutdownGroup

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime/debug"
+	"slices"
 	"time"
 )
 
@@ -67,9 +68,10 @@ func stoppingLine(reason error) string {
 	return "stopping: " + reason.Error()
 }
 
-// shutdown runs the groups in order; each handler's call refuses it once the deadline has passed
+// shutdown runs the groups, the last added first; each handler's call refuses it once the deadline
+// has passed
 func (s *shell[C, L]) shutdown(ctx context.Context) {
-	for _, group := range s.groups {
+	for _, group := range slices.Backward(s.groups) {
 		if !isExpired(s.deadline(), time.Now()) {
 			names := "no handlers"
 			if len(group.handlers) > 0 {
@@ -96,8 +98,7 @@ func catchPanic(fn func() error) (err error) {
 }
 
 // failures joins, in append order, the stop reason when it is an error, wire's error unless it is
-// the reason, the handlers' errors in the order they were added across groups in group order, and
-// the deadline error
+// the reason, the handlers' errors in the order they stopped, and the deadline error
 func (s *shell[C, L]) failures(reason, wireErr error) error {
 	var failures []error
 	// a signal, Stop(nil) and cancelling Run's ctx without a cause are clean stops; any other reason failed
@@ -108,7 +109,7 @@ func (s *shell[C, L]) failures(reason, wireErr error) error {
 		failures = append(failures, wireErr)
 	}
 	unfinished := false
-	for _, group := range s.groups {
+	for _, group := range slices.Backward(s.groups) {
 		for _, handler := range group.handlers {
 			if handler.err != nil {
 				failures = append(failures, fmt.Errorf("%s %s: %w", group.label(), handler.name, handler.err))

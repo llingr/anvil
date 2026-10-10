@@ -21,7 +21,7 @@
 //	}
 //
 // Run then waits for SIGINT, SIGTERM, Shell.Stop or the cancellation of its ctx. Groups stop one
-// after another, in the order they were added, and everything in a group stops together. The whole
+// after another, the last added first, and everything in a group stops together. The whole
 // shutdown has one deadline, 28s by default (WithShutdownGracePeriod), and Run returns the exit
 // code: 0 after a clean stop, 130 after Ctrl+C, and 1 after a failure it has logged.
 package anvil

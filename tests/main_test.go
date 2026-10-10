@@ -262,11 +262,11 @@ func TestMain(m *testing.M) {
 		}))
 	case "block":
 		hostMain(func(ctx context.Context, shell testShell) error {
+			shell.AddShutdownGroup().SetName("EGRESS") // stops after CORE, so never reached
 			shell.AddShutdownGroup(shutdown.Named("block", shutdown.HandlerFunc(func(ctx context.Context) error {
 				<-ctx.Done()
 				return ctx.Err()
 			}))).SetName("CORE")
-			shell.AddShutdownGroup().SetName("EGRESS")
 			fmt.Println("ready")
 			return nil
 		},
@@ -732,7 +732,7 @@ func inOrder(output string, fragments ...string) bool {
 func TestMainSignals(t *testing.T) {
 	code, output := runMain(t, "block", syscall.SIGTERM)
 	// the whole error is the deadline's, so block is not reported failing with its ctx's error
-	if code != 1 || !strings.Contains(output, "stopped with an error: shutdown deadline 400ms passed: group 1 (CORE) block\n") {
+	if code != 1 || !strings.Contains(output, "stopped with an error: shutdown deadline 400ms passed: group 2 (CORE) block\n") {
 		t.Fatalf("single SIGTERM exit %d: %s", code, output)
 	}
 	code, output = runMain(t, "block", syscall.SIGTERM, syscall.SIGTERM)

@@ -12,8 +12,8 @@ import (
 // errAddedLate refuses a change to the shutdown made once wire has returned
 var errAddedLate = errors.New("shutdown groups can only be changed during wiring")
 
-// AddShutdownGroup adds a group after the ones already added, holding handlers. Once wire has
-// returned it logs the refusal, and the group it returns refuses every change in the same way.
+// AddShutdownGroup adds a group, holding handlers, that stops before the ones already added. Once
+// wire has returned it logs the refusal, and the group it returns refuses every change in the same way.
 // Every change is decided under s.mu, so one made as wire returns is either kept or refused, never
 // lost, and a refusal is logged once the lock is released, since requestStop waits on that lock.
 func (s *shell[C, L]) AddShutdownGroup(handlers ...shutdown.Handler) ShutdownGroup {

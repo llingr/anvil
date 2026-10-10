@@ -67,21 +67,45 @@ The whole service, with its `Config` and `config.yaml`, is in [example/](example
 ## Shutdown Groups
 
 `shell.AddShutdownGroup` adds a group of handlers that stop together. Groups stop one after another,
-in the order they were added:
+the last added first, as deferred calls run. Add each group as its resource opens, and the service
+stops in the reverse of the order it started: here the server stops before the database it uses.
 
 ```go
-shell.AddShutdownGroup(server).Go(func(context.Context) error {
-    return server.ListenAndServe()
-}).SetName("HTTP")
+func wire(ctx context.Context, shell Shell) error {
+    cfg := shell.Config()
 
-shell.AddShutdownGroup(producer, shutdown.Named("postgres", shutdown.Close(db.Close))).SetName("FLUSH")
+    db, err := sql.Open("pgx", cfg.DatabaseURL)
+    if err != nil {
+        return err
+    }
+    shell.AddShutdownGroup(shutdown.Named("postgres", shutdown.IgnoreContext(db.Close)))
+    err = db.PingContext(ctx)
+    if err != nil {
+        return err
+    }
+
+    server := &http.Server{
+        Addr: cfg.Addr,
+    }
+    shell.AddShutdownGroup(server).Go(func(context.Context) error {
+        return server.ListenAndServe()
+    })
+    return nil
+}
 ```
+
+When `wire` returns an error partway, as it does here when the database is down at start, the shutdown
+still stops whatever was added. To stop a component earlier than where it opens, add its group later:
+a broadcaster that ends long-lived streams, for example, is added after the server, since the
+server's `Shutdown` waits for open connections to close.
 
 - A handler is anything with a `Shutdown(ctx context.Context) error` method, as `http.Server` has.
   It is named in the logs by its type. `shutdown.IgnoreContext` and `shutdown.Close` adapt other stop
   functions, and are wrapped in `shutdown.Named`, since their type cannot name them.
 - `Go` runs a function until its group stops, then cancels its context and waits for it to return.
   Whatever it returns then is a clean stop. An error or panic before then stops the service.
+- Groups are numbered in the order added, so the shutdown log counts down: `shutdown group 2 with
+  *http.Server, go`, then `shutdown group 1 with postgres`. `SetName` adds a name, as `group 2 (http)`.
 - Groups, handlers and goroutines are added while `wire` runs, and refused after it returns.
 - Every handler's context carries one deadline, 28s from the stop by default. At the deadline anvil
   calls no more handlers, logs which were still running, and `Run` returns 1.
