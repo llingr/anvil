@@ -12,10 +12,10 @@ github.com/knadh/koanf/providers/fs v1.0.1 h1:CfsoRTXgsuPOnXIj9LeFZju5pNnpF8woZa
 github.com/knadh/koanf/providers/fs v1.0.1/go.mod h1:FksHET+xXFNDozvj8ZCdom54OnZ6eGKJtC5FhZJKx/8=
 github.com/knadh/koanf/v2 v2.4.1 h1:MK2JDkLy4UGzEUkW1CCCKQftd9+M+NX8hAZ2axbf/jo=
 github.com/knadh/koanf/v2 v2.4.1/go.mod h1:gRb40VRAbd4iJMYYD5IxZ6hfuopFcXBpc9bbQpZwo28=
-github.com/llingr/anvil-koanf v0.2.0 h1:AqEe358qajF7AcQDS3PjaNuMvmAsoOC47IQG5gc4Osc=
-github.com/llingr/anvil-koanf v0.2.0/go.mod h1:WrKmmQsDFNpXI/M14a5vCxnbu+y2+wYp3ZIiX7faAHs=
-github.com/llingr/anvil-zap v0.2.1 h1:aBxTf3RFsJ+ZLDZaHy6osi5/JTBTTWVdz5rE1cpyvAs=
-github.com/llingr/anvil-zap v0.2.1/go.mod h1:2UkMK9Z0RImtKwXV9yCc+x4M+YFn5n/eK0vYW/UD4i8=
+github.com/llingr/anvil-koanf v0.2.1 h1:VlSHVGPuwgccze98NhCpFg8lwiYzF/d4IN9m0QZZVDQ=
+github.com/llingr/anvil-koanf v0.2.1/go.mod h1:ixjHq8Q3CT016n+HNt9SbMhm6+obV59+VsMIPsJPr5A=
+github.com/llingr/anvil-zap v0.2.2 h1:MeddxOn1XAJn9O902ZG+cCBKSkrTJyExCiVaHsO2ObU=
+github.com/llingr/anvil-zap v0.2.2/go.mod h1:7YDCwGATgMp8Jt+9p9XJVdKa7X74+ImUBT3biuXidME=
 github.com/mitchellh/copystructure v1.2.0 h1:vpKXTN4ewci03Vljg/q9QvCGUDttBOGBIa15WveJJGw=
 github.com/mitchellh/copystructure v1.2.0/go.mod h1:qLl+cE2AmVv+CoeAwDPye/v+N2HKCj9FbZEVFJRxO9s=
 github.com/mitchellh/reflectwalk v1.0.2 h1:G2LzWKi524PWgd3mLHV8Y5k7s6XUvT0Gef6zxSIeXaQ=
