@@ -1,13 +1,20 @@
 FUZZTIME ?= 30s
 FUZZPKGS ?= ./...
 
+# The library and the example service, each built and linted alone; only the library has tests
+MODULES := . example
+
+# Built with a Go at least as new as go.mod's go directive, which it refuses otherwise
+GOLANGCI_LINT_VERSION := v2.15.0
+
 default: build test
 
 all: build test lint fuzz mutation
 
+# -o /dev/null, as go build writes a binary when ./... matches a single main package
 build:
-	go build ./...
-	go vet ./...
+	@for module in $(MODULES); do \
+		(cd $$module && go build -o /dev/null ./... && go vet ./...) || exit 1; done
 
 test:
 	go test -race -coverpkg=./... -coverprofile=coverage.out ./...
@@ -15,7 +22,9 @@ test:
 
 # same image and version as the CI lint job, nothing installed on the host
 lint:
-	docker run --rm -v "$(CURDIR)":/app -w /app golangci/golangci-lint:v2.12.2 golangci-lint run ./...
+	@for module in $(MODULES); do \
+		docker run --rm -v "$(CURDIR)":/src -w /src/$$module \
+			golangci/golangci-lint:$(GOLANGCI_LINT_VERSION) golangci-lint run ./... || exit 1; done
 
 # each target runs on its own; FUZZTIME=5m FUZZPKGS=./shutdown/... make fuzz to narrow or lengthen the hunt
 fuzz:
