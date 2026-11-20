@@ -6,9 +6,9 @@ go 1.26.0
 replace github.com/llingr/anvil => ../
 
 require (
-	github.com/llingr/anvil v0.2.0
-	github.com/llingr/anvil-koanf v0.2.0
-	github.com/llingr/anvil-zap v0.2.1
+	github.com/llingr/anvil v0.2.1
+	github.com/llingr/anvil-koanf v0.2.1
+	github.com/llingr/anvil-zap v0.2.2
 	go.uber.org/zap v1.28.0
 )
 
