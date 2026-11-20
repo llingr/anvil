@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: '1.25'
+  GO_VERSION: '1.26'
 
 jobs:
   build:
@@ -18,16 +18,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - run: go build ./...
-      - run: go vet ./...
+      # the library and the example service, each its own module
+      - run: make build
       - name: Windows build and vet, tests included
-        run: GOOS=windows go vet ./...
+        run: |
+          GOOS=windows go vet ./...
+          (cd example && GOOS=windows go vet ./...)
       - name: go.mod and go.sum are tidy
-        run: go mod tidy -diff
+        run: |
+          go mod tidy -diff
+          (cd example && go mod tidy -diff)
 
   test:
     name: test (race + coverage)
@@ -38,7 +42,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
